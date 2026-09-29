@@ -64,7 +64,7 @@ name, with the ones that need you on top.
 | Omarchy (Hyprland + the Omarchy shell) | The bar icon, panel and centered window | For the panel |
 | Python 3 (standard library only) | The `speakeasy` engine | Yes |
 | tmux | Keeps each task's terminal alive and hidden | Yes |
-| At least one agent CLI | Something to run: `claude`, `codex`, `agy` (Antigravity CLI), `opencode`, `cursor-agent`, `crush` | Yes |
+| At least one agent CLI | Something to run: `claude`, `codex`, `agy` (Antigravity CLI), `muse`, `grok`, `copilot`, `hermes`, `cursor-agent`, `opencode`, `crush` | Yes |
 | notify-send (libnotify) | Desktop notifications | Recommended |
 | A terminal emulator | To show a task when you open it; `xdg-terminal-exec` is used when present | Yes |
 
@@ -144,6 +144,7 @@ first line of the answer.
 | `p` | Peek: the last lines of its screen, updated live |
 | `x` | Stop a running task, or remove an ended one; press `x`, `Enter` or `y` again to confirm |
 | `c` | Clear every ended task |
+| `s` | Settings |
 | `Esc` | Cancel a confirmation, close the peek, then close the panel |
 
 ### Starting a task
@@ -172,6 +173,21 @@ window. The task keeps going, and the list shows it working again.
 Every task's terminal has a status line at the bottom with its name and
 agent, and a reminder that closing the window only hides it.
 
+### Settings
+
+Press `s` in the task list (or the Settings button). `↑` `↓` pick a row and
+`Enter` or `Space` changes it:
+
+- **Agents:** every agent Speakeasy knows, installed ones first. Set any of
+  them to *Hidden* to keep it out of the new-task picker; installed agents
+  you never use stay out of the way.
+- **Notifications:** on or off.
+- **Default folder:** where new tasks start. `Enter` on the row edits it,
+  `Enter` again saves.
+
+Speakeasy looks for installed agents on every refresh (every few seconds
+while the panel is open), so an agent you install shows up by itself.
+
 ## Agents and models
 
 | Agent | Models offered | Effort | How Speakeasy knows its state |
@@ -179,6 +195,10 @@ agent, and a reminder that closing the window only hides it.
 | Claude Code (`claude`) | The aliases `fable`, `opus`, `sonnet`, `haiku` (always the newest release), `opusplan`, the 1M-context variants, and pinned versions (Opus 5.5 back to 4.1, Sonnet 5.5 back to 4.5, Fable 5.1, Haiku 4.5) | low, medium, high, xhigh, max | Hooks: approval needed, turn finished, working |
 | Codex (`codex`) | Whatever Codex lists for your account, read from `~/.codex/models_cache.json`, which Codex keeps up to date | Each model's own reasoning levels | `notify` (turn finished) and a quiet screen |
 | Gemini (Antigravity CLI, `agy`) | Whatever `agy models` lists for your account, refreshed in the background every 6 hours | Part of the model name | Quiet screen |
+| Muse (`muse`, Meta's Muse Code) | Muse's own catalog (`~/.local/share/muse/model-catalog/`) | Each model's own levels | Quiet screen |
+| Grok (`grok`) | Whatever `grok models` lists for your account, refreshed every 6 hours | — | Quiet screen |
+| GitHub Copilot (`copilot`) | The agent's default | none to max | Quiet screen |
+| Hermes (`hermes`) | The agent's default (runs `hermes chat`) | — | Quiet screen |
 | Cursor Agent (`cursor-agent`) | default, composer-2.5, composer-2.5-fast, gpt-5.5, sonnet-4, opus | — | Quiet screen |
 | opencode, Crush | The agent's default (add more in the config) | — | Quiet screen (Crush's prompt is typed in for you) |
 
@@ -194,8 +214,10 @@ a guarantee; Claude Code and Codex report exactly.
 Agents ask a few one-time questions in a new folder. Speakeasy spots them and
 marks the task *needs you* with the question, so open the terminal and answer:
 
-- **Trust this folder?** Claude Code, Codex and the Antigravity CLI all ask
-  the first time they run in a folder.
+- **Trust this folder?** Claude Code, Codex, the Antigravity CLI, Muse and
+  Copilot all ask the first time they run in a folder.
+- **Sign in:** an agent whose login has expired shows a browser sign-in code;
+  the task says so.
 - **Hooks need review** (Codex): Codex asks you to approve hooks from
   `~/.codex/hooks.json` in every new session until you trust them once in
   Codex itself.
@@ -218,7 +240,9 @@ speakeasy rename login "Fix the login loop"
 speakeasy stop login                          # stop, keep it in the list
 speakeasy rm login                            # stop and remove
 speakeasy clear                               # remove every ended task
-speakeasy agents                              # which agents are installed
+speakeasy agents                              # which agents are installed, which are hidden
+speakeasy agents --hide crush --show codex    # choose what the new-task picker offers
+speakeasy set notify off                      # also: default-cwd PATH, quiet-seconds N, terminal CMD
 speakeasy models [agent] [--refresh]          # which models each offers
 speakeasy ui [new]                            # the panel, or a terminal without Omarchy
 ```
@@ -266,6 +290,7 @@ Optional, in `~/.config/speakeasy/config.json`:
 | `quietSeconds` | How long a watched agent's screen must be still before it counts as done or waiting |
 | `notify` | `false` turns notifications off |
 | `agents` | Override a built-in agent (any field) or add your own |
+| `hiddenAgents` | Agent ids left out of the new-task picker (Settings changes this) |
 
 An agent entry takes `name`, `bin`, `models` (`""` is the agent's default),
 `modelLabels`, `modelFlag` (passed as `<flag>=<model>`), and `prompt`: `arg`
