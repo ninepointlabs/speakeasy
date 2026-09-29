@@ -85,6 +85,60 @@ Panel {
   // Settings view: every known agent (installed first) with show / hide,
   // then notifications and the default folder.
   property var appSettings: ({})
+  property string defaultCwdPath: ""
+
+  // Folder browser under the Folder field: recent task folders, then the
+  // subfolders matching what is typed (shell-completion style).
+  property var dirRows: []
+  property int browseIndex: -1
+  property bool dirsExists: true
+  property bool dirsQueued: false
+  // Screenshot mode never has the keyboard, so count the Folder row as focused.
+  readonly property bool folderBrowsing: view === "new" && (folderField.activeFocus || (capturing && formFocus === 5))
+
+  function queryDirs() {
+    if (dirsProc.running) { dirsQueued = true; return }
+    dirsProc.command = [cli, "dirs", "--", folderField.text]
+    dirsProc.running = true
+  }
+
+  function applyDirs(text) {
+    var data
+    try { data = JSON.parse(text) } catch (e) { return }
+    var rows = []
+    var seen = ({})
+    var recent = data.recent || []
+    for (var i = 0; i < recent.length; i++) { seen[recent[i].path] = true; rows.push({ name: recent[i].name, path: recent[i].path, git: recent[i].git, recent: true }) }
+    var entries = data.entries || []
+    for (var j = 0; j < entries.length; j++) if (!seen[entries[j].path]) rows.push({ name: entries[j].name, path: entries[j].path, git: entries[j].git, recent: false })
+    dirRows = rows
+    dirsExists = data.exists !== false
+    if (browseIndex >= rows.length) browseIndex = rows.length - 1
+  }
+
+  function browseMove(delta) {
+    if (dirRows.length === 0) return
+    browseIndex = Math.max(-1, Math.min(dirRows.length - 1, browseIndex + delta))
+    if (browseIndex >= 0) dirList.positionViewAtIndex(browseIndex, ListView.Contain)
+  }
+
+  // Step into a folder: it becomes the path, and its subfolders are listed.
+  function browseInto(i) {
+    var row = dirRows[i]
+    if (!row) return
+    folderField.text = row.path + "/"
+    folderField.cursorPosition = folderField.text.length
+    browseIndex = -1
+    folderField.forceActiveFocus()
+  }
+
+  function folderUp() {
+    var t = folderField.text.replace(/\/+$/, "")
+    var cut = t.lastIndexOf("/")
+    if (cut < 0) return
+    folderField.text = t.slice(0, cut + 1)
+    folderField.cursorPosition = folderField.text.length
+  }
   property int settingsIndex: 0
   readonly property var settingsRows: {
     var rows = []
@@ -133,6 +187,7 @@ Panel {
     tasks = data.tasks || []
     agentList = data.agents || []
     appSettings = data.settings || ({})
+    defaultCwdPath = data.defaultCwd || ""
     if (agentIndex >= installedAgents.length) agentIndex = 0
     if (settingsIndex >= settingsRows.length) settingsIndex = Math.max(0, settingsRows.length - 1)
     prefs = data.prefs || ({})
@@ -219,7 +274,9 @@ Panel {
     effort = currentEfforts.indexOf(prefs.effort || "") >= 0 ? prefs.effort : ""
     titleField.text = ""
     descArea.text = ""
-    folderField.text = prefs.cwd ? folderName(prefs.cwd) : ""
+    // Start from the default folder; recent ones are a ↓ away in the browser.
+    folderField.text = defaultCwdPath !== "" ? folderName(defaultCwdPath).replace(/\/?$/, "/") : ""
+    browseIndex = -1
     setFormFocus(3)
   }
 
@@ -357,7 +414,10 @@ Panel {
       else if (name.indexOf("focus:") === 0) setFormFocus(Number(name.slice(6)))
       else if (name.indexOf("title:") === 0) titleField.text = name.slice(6)
       else if (name.indexOf("desc:") === 0) descArea.text = name.slice(5)
-      else if (name.indexOf("folder:") === 0) folderField.text = name.slice(7)
+      else if (name.indexOf("folder:") === 0) { folderField.text = name.slice(7); queryDirs() }
+      else if (name === "down") browseMove(1)
+      else if (name === "up") browseMove(-1)
+      else if (name === "enter") { if (browseIndex >= 0) browseInto(browseIndex); else submit() }
       else return "unknown key"
     }
     return "ok"
@@ -557,6 +617,17 @@ Panel {
       if (cb) cb(code, actionOut.text, actionErr.text.trim())
       else if (code !== 0) root.error = actionErr.text.trim().replace(/^speakeasy: /, "")
       root.refresh()
+    }
+  }
+
+  Process {
+    id: dirsProc
+    environment: root.procEnv
+    running: false
+    stdout: StdioCollector { id: dirsOut }
+    onExited: function(code) {
+      if (code === 0) root.applyDirs(dirsOut.text)
+      if (root.dirsQueued) { root.dirsQueued = false; Qt.callLater(root.queryDirs) }
     }
   }
 
@@ -1262,12 +1333,118 @@ Panel {
             foreground: root.foreground
             accent: root.accent
             font.family: root.fontFamily
-            onActiveFocusChanged: if (activeFocus) root.formFocus = 5
-            Keys.onReturnPressed: root.submit()
-            Keys.onEnterPressed: root.submit()
-            Keys.onTabPressed: root.moveFocus(1)
-            Keys.onBacktabPressed: root.moveFocus(-1)
-            Keys.onEscapePressed: root.showList()
+            onActiveFocusChanged: if (activeFocus) { root.formFocus = 5; root.browseIndex = -1; root.queryDirs() }
+            onTextChanged: if (activeFocus) { root.browseIndex = -1; dirsDebounce.restart() }
+            Keys.onPressed: function(event) {
+              var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+              var alt = (event.modifiers & Qt.AltModifier) !== 0
+              var picking = root.browseIndex >= 0
+              if (event.key === Qt.Key_Down) { root.browseMove(1); event.accepted = true }
+              else if (event.key === Qt.Key_Up && alt) { root.folderUp(); event.accepted = true }
+              else if (event.key === Qt.Key_Up) { if (picking) root.browseMove(-1); else root.moveFocus(-1); event.accepted = true }
+              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                if (picking && !ctrl) root.browseInto(root.browseIndex)
+                else root.submit()
+                event.accepted = true
+              }
+              else if (event.key === Qt.Key_Right && picking) { root.browseInto(root.browseIndex); event.accepted = true }
+              else if (event.key === Qt.Key_Tab) { if (picking) root.browseInto(root.browseIndex); else root.moveFocus(1); event.accepted = true }
+              else if (event.key === Qt.Key_Backtab) { root.moveFocus(-1); event.accepted = true }
+              else if (event.key === Qt.Key_Escape) { if (picking) root.browseIndex = -1; else root.showList(); event.accepted = true }
+            }
+          }
+
+          Timer {
+            id: dirsDebounce
+            interval: 120
+            onTriggered: root.queryDirs()
+          }
+
+          Text {
+            visible: root.folderBrowsing && !root.dirsExists
+            textFormat: Text.PlainText
+            text: "No such folder yet: keep typing, or Alt+↑ to go up a level."
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Rectangle {
+            visible: root.folderBrowsing && root.dirRows.length > 0
+            width: parent.width
+            height: Math.min(dirList.contentHeight, Style.space(34) * 7) + Style.space(8)
+            radius: Style.cornerRadius
+            color: Style.normalFillFor(root.foreground, root.accent)
+            border.width: Style.spacing.hairline
+            border.color: Style.normalBorderFor(root.foreground, root.accent)
+            clip: true
+
+            ListView {
+              id: dirList
+              anchors.fill: parent
+              anchors.margins: Style.space(4)
+              model: root.dirRows
+              boundsBehavior: Flickable.StopAtBounds
+
+              delegate: Rectangle {
+                id: dirRow
+                required property var modelData
+                required property int index
+                readonly property bool picked: index === root.browseIndex
+                width: dirList.width
+                height: Style.space(34)
+                radius: Style.cornerRadius
+                color: picked || dirMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : "transparent"
+                border.width: picked ? Math.max(1, Style.space(2)) : 0
+                border.color: root.accent
+
+                MouseArea {
+                  id: dirMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.browseInto(dirRow.index)
+                }
+
+                Text {
+                  id: dirGlyph
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: String.fromCodePoint(dirRow.modelData.recent ? 0xF02DA : 0xF024B)
+                  color: dirRow.modelData.recent ? root.accent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  anchors.left: dirGlyph.right
+                  anchors.leftMargin: Style.space(8)
+                  anchors.right: dirTag.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: dirRow.modelData.recent ? dirRow.modelData.path : dirRow.modelData.name
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: dirRow.picked
+                  elide: Text.ElideMiddle
+                }
+                Text {
+                  id: dirTag
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: (dirRow.modelData.recent ? "recent" : "") + (dirRow.modelData.recent && dirRow.modelData.git ? " · " : "")
+                        + (dirRow.modelData.git ? "git" : "")
+                  color: root.faint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
           }
 
           Row {
@@ -1313,7 +1490,9 @@ Panel {
           width: parent.width
           textFormat: Text.PlainText
           text: root.view === "new"
-            ? "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back"
+            ? (root.formFocus === 5
+               ? "Type a path  ·  ↓↑ pick a folder  ·  Enter or → open it  ·  Alt+↑ up a level  ·  Enter (nothing picked) or Ctrl+Enter start  ·  Esc back"
+               : "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back")
             : root.view === "settings"
               ? "↑↓ pick  ·  Enter or Space toggle / edit  ·  Enter saves the folder  ·  Esc back"
               : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear finished  ·  s settings  ·  Esc close"
@@ -1321,7 +1500,7 @@ Panel {
           color: root.faint
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
+          wrapMode: Text.Wrap
         }
       }
     }

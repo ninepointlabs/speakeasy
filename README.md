@@ -159,8 +159,16 @@ first line of the answer.
 | `Ctrl+Enter` anywhere | Start the task |
 | `Esc` | Back to the list |
 
-Only agents installed on your machine are offered. Speakeasy remembers the
-last agent, model, effort and folder you used. The title is what the task is
+**Folder.** New tasks start in your default folder (Settings). To work on an
+existing project, go to Folder and browse: the list below it shows your
+recent task folders, then the subfolders matching what you have typed, like
+tab-completion in a shell (`~/Projects/sto` lists what starts with "sto";
+git repositories are marked). `↓` `↑` pick one, `Enter` or `→` steps into
+it, `Alt+↑` goes up a level, and `Enter` with nothing picked starts the task
+there. The mouse works too: click a folder to step into it.
+
+Only agents installed (and not hidden in Settings) are offered. Speakeasy remembers the
+last agent, model and effort you used. The title is what the task is
 called everywhere: the list, notifications and the terminal's window title.
 If you leave it empty, the first line of the description is used.
 

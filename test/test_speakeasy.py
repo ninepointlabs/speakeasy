@@ -262,6 +262,34 @@ class NewAgents(unittest.TestCase):
         self.assertEqual(argv[-1], "--query=fix it")
 
 
+class Dirs(unittest.TestCase):
+    def dirs(self, text):
+        out = io.StringIO()
+        old, sys.stdout = sys.stdout, out
+        try:
+            se.main(["dirs", "--", text])
+        finally:
+            sys.stdout = old
+        return json.loads(out.getvalue())
+
+    def test_completion(self):
+        root = os.path.join(TMP, "proj")
+        for d in ("alpha", "alpine", "beta", ".hidden", "zalp"):
+            os.makedirs(os.path.join(root, d), exist_ok=True)
+        os.makedirs(os.path.join(root, "alpha", ".git"), exist_ok=True)
+        open(os.path.join(root, "alpaca.txt"), "w").close()
+        names = [e["name"] for e in self.dirs(root + "/")["entries"]]
+        self.assertEqual(names, ["alpha", "alpine", "beta", "zalp"])  # folders only, no dot-folders
+        got = self.dirs(root + "/alp")["entries"]
+        self.assertEqual([e["name"] for e in got], ["alpha", "alpine", "zalp"])  # prefix first, then contains
+        self.assertTrue(got[0]["git"])
+        self.assertEqual([e["name"] for e in self.dirs(root + "/.h")["entries"]], [".hidden"])
+        self.assertFalse(self.dirs("/does/not/exist/x")["exists"])
+
+    def test_dash_path_is_a_path(self):
+        self.assertEqual(self.dirs("-rf")["entries"], [])
+
+
 class State(unittest.TestCase):
     def test_deleted_remembered_folder_falls_back_to_default(self):
         se.write_json(se.PREFS_PATH, {"agent": "claude", "model": "", "cwd": "/does/not/exist"})

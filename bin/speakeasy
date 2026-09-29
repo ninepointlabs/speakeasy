@@ -554,7 +554,10 @@ def cmd_new(a):
     }
     os.makedirs(TASKS_DIR, exist_ok=True)
     write_json(task_path(tid), task)
-    write_json(PREFS_PATH, {"agent": agent["id"], "model": task["model"], "effort": effort, "cwd": cwd})
+    old = load_json(PREFS_PATH, {})
+    recent = [cwd] + [d for d in old.get("recentCwds") or [] if d != cwd]
+    write_json(PREFS_PATH, {"agent": agent["id"], "model": task["model"], "effort": effort, "cwd": cwd,
+                            "recentCwds": recent[:10]})
 
     write_tmux_conf()
     label = " · ".join(x for x in (agent["name"], agent["modelLabels"].get(task["model"], task["model"]),
@@ -950,6 +953,7 @@ def cmd_state(a):
         "tasks": tasks,
         "prefs": {"agent": prefs.get("agent", ""), "model": prefs.get("model", ""), "effort": prefs.get("effort", ""),
                   "cwd": prefs.get("cwd") or os.path.expanduser(cfg.get("defaultCwd") or "~")},
+        "defaultCwd": default_cwd(cfg),
     }
     print(json.dumps(out))
 
@@ -1002,6 +1006,59 @@ def cmd_set(a):
         die(f"folder does not exist: {value}")
     update_config(**{key: value})
     print(f"{a.key} = {value}")
+
+
+def default_cwd(cfg):
+    d = os.path.expanduser(cfg.get("defaultCwd") or "~")
+    return d if os.path.isdir(d) else HOME
+
+
+def tilde(path):
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + "/") else path
+
+
+def cmd_dirs(a):
+    """Folder completion for the new-task form: the subfolders matching what
+    has been typed so far, plus recent task folders."""
+    text = a.path
+    full = os.path.expanduser(text) if text else ""
+    if not text:
+        base, prefix = HOME, ""
+    elif text.endswith("/"):
+        base, prefix = full, ""
+    else:
+        base, prefix = os.path.dirname(full) or "/", os.path.basename(full)
+    entries = []
+    try:
+        with os.scandir(base) as it:
+            for e in it:
+                if e.name.startswith(".") and not prefix.startswith("."):
+                    continue
+                try:
+                    if not e.is_dir():
+                        continue
+                except OSError:
+                    continue
+                entries.append(e)
+    except OSError:
+        pass
+    low = prefix.lower()
+    starts = sorted((e for e in entries if e.name.lower().startswith(low)), key=lambda e: e.name.lower())
+    inside = sorted((e for e in entries if low and low in e.name.lower() and not e.name.lower().startswith(low)),
+                    key=lambda e: e.name.lower())
+    out = [{"name": e.name, "path": tilde(e.path), "git": os.path.exists(os.path.join(e.path, ".git"))}
+           for e in (starts + inside)[:a.limit]]
+    recent = []
+    if not prefix or not text:
+        seen = load_json(PREFS_PATH, {}).get("recentCwds") or []
+        for t in sorted(all_tasks(), key=lambda t: t.get("createdAt", ""), reverse=True):
+            if t.get("cwd") and t["cwd"] not in seen:
+                seen.append(t["cwd"])
+        for d in seen:
+            if os.path.isdir(d) and (not text or tilde(d).startswith(text) or d.startswith(full)):
+                recent.append({"name": os.path.basename(d) or d, "path": tilde(d),
+                               "git": os.path.exists(os.path.join(d, ".git"))})
+    print(json.dumps({"base": tilde(base), "exists": os.path.isdir(base), "entries": out, "recent": recent[:6]}))
 
 
 def cmd_peek(a):
@@ -1119,6 +1176,11 @@ def main(argv=None):
     s = sub.add_parser("open", help="show a task's terminal (or `next` waiting task)")
     s.add_argument("ref")
     s.set_defaults(fn=cmd_open)
+
+    s = sub.add_parser("dirs", help="folder completion for the new-task form (JSON)")
+    s.add_argument("path", nargs="?", default="")
+    s.add_argument("--limit", type=int, default=200)
+    s.set_defaults(fn=cmd_dirs)
 
     s = sub.add_parser("peek", help="print the last lines of a task's screen")
     s.add_argument("ref")
