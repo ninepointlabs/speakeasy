@@ -42,7 +42,7 @@ BarWidget {
   // IPC binds to one monitor's widget; test calls go to whichever panel is open.
   function openPanel() {
     var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : [root]
-    for (var i = 0; i < items.length; i++) if (items[i] && items[i].opened === true) return items[i].panel
+    for (var i = 0; i < items.length; i++) if (items[i] && items[i].panel && items[i].panel.shown === true) return items[i].panel
     return panel
   }
 
@@ -90,11 +90,13 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
-    function isOpen(): string { return root.anyOpened() ? "true" : "false" }
+    function isOpen(): string { return root.anyOpened() || (root.panel && root.panel.centered) ? "true" : "false" }
+    // Keybinding entry: a centered window on the focused monitor. "list" toggles, "new" opens the form.
+    function present(view: string): string { return root.panel ? root.panel.present(view === "new" ? "new" : "list") : "no panel" }
     function status(): string {
       var p = root.openPanel()
       if (!p) return "{}"
-      return JSON.stringify({ open: p.opened, view: p.view, loaded: p.loaded, tasks: p.tasks.length,
+      return JSON.stringify({ open: p.opened, centered: p.centered, view: p.view, loaded: p.loaded, tasks: p.tasks.length,
                               needs: p.needsCount, done: p.doneCount, working: p.workingCount,
                               selected: p.selected, error: p.error })
     }

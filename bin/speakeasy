@@ -971,28 +971,16 @@ def cmd_clear(a):
 
 
 PLUGIN_ID = "ninepointlabs.speakeasy"
-INTENT_PATH = os.path.join(STATE_DIR, "intent")
 
 
 def cmd_ui(a):
-    """Keybinding entry point: the Omarchy panel if it is there, else a terminal."""
+    """Keybinding entry point: the centered Omarchy window if it is there, else a terminal."""
     shell = shutil.which("omarchy-shell")
-    if shell and subprocess.run([shell, "shell", "ping"], stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL).returncode == 0:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(INTENT_PATH, "w") as f:
-            f.write(a.view + "\n")
-        # The panel reads the intent when it opens; bar-widget summons carry no
-        # payload. The list view toggles; the form always opens.
-        if a.view == "list":
-            r = subprocess.run([shell, PLUGIN_ID, "isOpen"], text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            if r.stdout.strip() == "true":
-                subprocess.run([shell, "shell", "hide", PLUGIN_ID])
-                return
-        r = subprocess.run([shell, "shell", "summon", PLUGIN_ID, "{}"], text=True,
+    if shell:
+        # `list` toggles the window; `new` opens it on the form.
+        r = subprocess.run([shell, PLUGIN_ID, "present", a.view], text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        if r.stdout.strip() == "ok":
+        if r.stdout.strip() in ("ok", "hidden"):
             return
     prefix = terminal_prefix(config())
     if not prefix:

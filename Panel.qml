@@ -2,11 +2,16 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
+import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 
 // The Speakeasy panel: the list of tasks (attention first), a peek at the
-// selected task's screen, and the form that starts a new one. Everything
+// selected task's screen, and the form that starts a new one. It shows two
+// ways: dropped from the bar icon, or (from a keybinding) as a window in
+// the middle of the focused screen. The same content item moves between the
+// two hosts, so there is one UI to keep keyboard-complete. Everything
 // runs through the bundled `speakeasy` CLI; this file only renders state
 // and forwards keys.
 Panel {
@@ -48,6 +53,12 @@ Panel {
     for (var i = 0; i < tasks.length; i++) if (pred(tasks[i])) n++
     return n
   }
+
+  // Centered presentation (keybinding) instead of the bar dropdown.
+  property bool centered: false
+  property var targetScreen: null
+  property Item keyHome: null
+  readonly property bool shown: opened || centered
 
   // "list" or "new"
   property string view: "list"
@@ -142,7 +153,7 @@ Panel {
     // it shows the final output, unless the session itself is gone.
     if (t.alive === false) { error = "That task's terminal is gone (after a reboot, say). Remove it with x."; return }
     Quickshell.execDetached([cli, "open", t.id])
-    close()
+    dismiss()
   }
 
   function stopOrRemove() {
@@ -265,7 +276,7 @@ Panel {
 
   // Headless test hook: drive the panel by key name over IPC.
   function ipcKey(name) {
-    if (!opened) return "closed"
+    if (!shown) return "closed"
     if (view === "list") {
       if (name === "down") move(1)
       else if (name === "up") move(-1)
@@ -274,7 +285,7 @@ Panel {
       else if (name === "p") togglePeek()
       else if (name === "x") stopOrRemove()
       else if (name === "c") clearFinished()
-      else if (name === "esc") { if (confirmId !== "") confirmId = ""; else close() }
+      else if (name === "esc") { if (confirmId !== "") confirmId = ""; else dismiss() }
       else return "unknown key"
     } else {
       if (name === "esc") showList()
@@ -359,16 +370,63 @@ Panel {
   implicitWidth: 1
   implicitHeight: 1
 
-  onOpenedChanged: {
+  function onShown() {
     confirmId = ""
-    if (!opened) { peekOn = false; return }
     view = "list"
+    error = ""
     refresh()
-    intentProc.running = true
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  Component.onCompleted: refresh()
+  onOpenedChanged: {
+    if (!opened) { if (!centered) { peekOn = false; confirmId = "" } return }
+    // The bar dropdown wins over a centered window on the same monitor.
+    if (centered) leaveCenter()
+    onShown()
+  }
+
+  // Keybinding entry: show the centered window on the focused monitor.
+  // `list` toggles; `new` always opens (straight into the form).
+  function present(which) {
+    if (centered && which !== "new") { dismiss(); return "hidden" }
+    if (opened) close()
+    targetScreen = focusedScreen()
+    if (!centered) {
+      keyCatcher.parent = centerHost
+      centered = true
+      onShown()
+    }
+    if (which === "new") {
+      if (loaded) showNew()
+      else pendingNew = true
+    }
+    return "ok"
+  }
+
+  function leaveCenter() {
+    centered = false
+    if (keyHome) keyCatcher.parent = keyHome
+  }
+
+  // Close whichever way the panel is showing.
+  function dismiss() {
+    confirmId = ""
+    peekOn = false
+    if (centered) leaveCenter()
+    else close()
+  }
+
+  function focusedScreen() {
+    var name = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+    var list = Quickshell.screens
+    for (var i = 0; i < list.length; i++) if (list[i].name === name) return list[i]
+    return list.length > 0 ? list[0] : null
+  }
+
+  Component.onCompleted: {
+    keyHome = keyCatcher.parent
+    refresh()
+  }
 
   // ------------------------------------------------------------ processes --
 
@@ -407,20 +465,6 @@ Panel {
     onExited: function(code) { root.peekText = code === 0 ? peekOut.text.replace(/\s+$/, "") : "" }
   }
 
-  // `speakeasy ui new` leaves an intent file, because bar-widget summons
-  // carry no payload. Read it (and remove it) whenever the panel opens.
-  Process {
-    id: intentProc
-    running: false
-    command: ["sh", "-c", "cat \"$1\" 2>/dev/null; rm -f \"$1\"", "sh", root.stateDir + "/intent"]
-    stdout: StdioCollector { id: intentOut }
-    onExited: {
-      if (intentOut.text.trim() === "new") {
-        if (root.loaded) root.showNew()
-        else root.pendingNew = true
-      }
-    }
-  }
   property bool pendingNew: false
   onLoadedChanged: if (loaded && pendingNew) { pendingNew = false; showNew() }
 
@@ -433,7 +477,7 @@ Panel {
   }
 
   Timer {
-    interval: root.opened ? 4000 : 20000
+    interval: root.shown ? 4000 : 20000
     repeat: true
     running: true
     onTriggered: root.refresh()
@@ -442,7 +486,7 @@ Panel {
   Timer {
     interval: 2000
     repeat: true
-    running: root.opened && root.peekOn && root.view === "list"
+    running: root.shown && root.peekOn && root.view === "list"
     onTriggered: root.refreshPeek()
   }
 
@@ -465,9 +509,9 @@ Panel {
       onCloseRequested: {
         if (root.confirmId !== "") { root.confirmId = ""; return }
         if (root.peekOn) { root.peekOn = false; return }
-        root.close()
+        root.dismiss()
       }
-      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTabRequested: function(direction) { if (!root.centered) root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) { if (dy !== 0) root.move(dy) }
       onActivateRequested: {
         if (root.confirmId !== "") root.stopOrRemove()
@@ -1057,6 +1101,54 @@ Panel {
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+      }
+    }
+  }
+
+  // ------------------------------------------------------ centered window --
+
+  PanelWindow {
+    id: centerWin
+    visible: root.centered
+    screen: root.targetScreen
+    anchors { top: true; bottom: true; left: true; right: true }
+    color: "transparent"
+    WlrLayershell.namespace: "omarchy-speakeasy"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    exclusionMode: ExclusionMode.Ignore
+
+    onVisibleChanged: if (visible) Qt.callLater(function() {
+      if (root.view === "new") root.setFormFocus(root.formFocus)
+      else keyCatcher.forceActiveFocus()
+    })
+
+    Rectangle {
+      anchors.fill: parent
+      color: Qt.rgba(0, 0, 0, 0.45)
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      onClicked: root.dismiss()
+    }
+
+    BorderSurface {
+      id: centerCard
+      anchors.centerIn: parent
+      width: Math.min(parent.width - Style.space(80), Style.space(680))
+      height: Math.min(parent.height - Style.space(80), content.implicitHeight + Style.spacing.popupPadding * 2)
+      radius: Style.cornerRadius
+      color: Color.popups.background
+      borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+
+      // Clicks inside the card must not reach the scrim's dismiss.
+      MouseArea { anchors.fill: parent }
+
+      Item {
+        id: centerHost
+        anchors.fill: parent
+        anchors.margins: Style.spacing.popupPadding
       }
     }
   }

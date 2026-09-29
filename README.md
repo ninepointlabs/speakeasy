@@ -38,6 +38,11 @@ o.bind("SUPER + A", "Speakeasy tasks", "speakeasy ui")
 o.bind("SUPER + ALT + A", "Speakeasy new task", "speakeasy ui new")
 ```
 
+`SUPER + A` and `SUPER + ALT + A` open Speakeasy as a window in the middle of
+the focused screen, with the keyboard already in it; clicking the bar icon
+drops the same panel from the bar instead. Everything works from the
+keyboard in both.
+
 The bar chip is a cocktail glass. `!2` in the urgent colour means two tasks
 need you, `✓1` means one finished that you haven't looked at yet, and a plain
 number counts the tasks still working.
