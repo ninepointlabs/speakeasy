@@ -46,10 +46,12 @@ number counts the tasks still working.
 `p` peek at the screen without opening it · `x` stop (or remove, if finished),
 press again to confirm · `c` clear finished tasks · `Esc` close.
 
-**New task:** `←→` choose agent, `Tab` to the model row, `←→` choose model,
-then title, description (Enter adds a line) and folder. `Ctrl+Enter` starts it
-from anywhere in the form, and `Esc` goes back. Speakeasy remembers the last
-agent, model and folder you used.
+**New task:** `←→` choose the agent, `Tab` to the model. `Enter` opens the
+model list and you type to filter it ("opus", "4.6", "flash"); `←→` also steps
+through models without opening the list. Agents that have one get an effort
+row the same way. Then title, description (Enter adds a line) and folder.
+`Ctrl+Enter` starts the task from anywhere in the form, and `Esc` goes back.
+Speakeasy remembers the last agent, model, effort and folder you used.
 
 ## Any other Linux
 
@@ -59,7 +61,7 @@ and tmux. `notify-send` adds notifications; any terminal emulator works.
 ```bash
 ./install.sh --cli
 speakeasy new -i                     # asks for agent, model, title, description, folder
-speakeasy new -a claude -m opus -t "Fix login" -p "The redirect after login loops…" -C ~/code/app
+speakeasy new -a claude -m opus -e high -t "Fix login" -p "The redirect after login loops…" -C ~/code/app
 speakeasy list                       # attention first; * marks unseen results
 speakeasy open login                 # by id, id prefix or part of the title
 speakeasy open next                  # the task that most needs you
@@ -76,8 +78,8 @@ Omarchy shell they open a terminal with the interactive prompts or the list.
 
 | Agent        | Models offered                     | How Speakeasy knows its state |
 |--------------|------------------------------------|-------------------------------|
-| Claude Code  | default, fable, opus, sonnet, haiku | hooks (approval, done, working) |
-| Codex        | default                            | `notify` (turn finished) + quiet screen |
+| Claude Code  | the aliases (fable, opus, sonnet, haiku: always the newest), `opusplan`, the 1M-context variants, and pinned versions back to Opus 4.1 and Sonnet 4.5; effort low to max | hooks (approval, done, working) |
+| Codex        | what Codex lists for your account (read from `~/.codex/models_cache.json`, which Codex keeps fresh), with each model's own reasoning levels | `notify` (turn finished) + quiet screen |
 | Gemini (Antigravity CLI, `agy`) | whatever `agy models` lists for your account, refreshed every 6 hours | quiet screen |
 | opencode     | default                            | quiet screen |
 | Cursor Agent | default, composer-2.5, composer-2.5-fast, gpt-5.5, sonnet-4, opus | quiet screen |

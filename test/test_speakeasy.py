@@ -66,6 +66,11 @@ class Pure(unittest.TestCase):
         self.assertEqual(se.first_line("\n\n## Done\nmore"), "Done")
         self.assertEqual(se.first_line("x" * 200, 10), "x" * 9 + "…")
 
+    def test_blocking_questions(self):
+        self.assertIn("hooks", se.blocking_question("  Hooks need review\n 1 hook is new"))
+        self.assertEqual(se.blocking_question("Do you trust the contents of this project?"), "Asks whether to trust this folder.")
+        self.assertEqual(se.blocking_question("● OK"), "")
+
     def test_codex_title_turn(self):
         self.assertTrue(se.is_codex_title_turn('{"title":"Tell a joke"}'))
         self.assertFalse(se.is_codex_title_turn("A normal reply"))
@@ -101,6 +106,35 @@ class Pure(unittest.TestCase):
         argv, typed = se.build_command(make_task(agent="crush"), se.agent_by_id("crush"))
         self.assertNotIn("fix it", argv)
         self.assertEqual(typed, "fix it")
+
+    def test_effort_flags(self):
+        argv, _ = se.build_command(make_task(effort="high"), se.agent_by_id("claude"))
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        argv, _ = se.build_command(make_task(agent="codex", effort="xhigh"), se.agent_by_id("codex"))
+        self.assertIn('model_reasoning_effort="xhigh"', argv)
+        argv, _ = se.build_command(make_task(agent="antigravity", effort="high"), se.agent_by_id("antigravity"))
+        self.assertFalse(any("effort" in a for a in argv))
+
+    def test_codex_models_come_from_its_cache(self):
+        path = os.path.join(TMP, "codex-models.json")
+        se.write_json(path, {"models": [
+            {"slug": "gpt-a", "display_name": "GPT-A", "visibility": "list",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "max"}]},
+            {"slug": "gpt-b", "display_name": "GPT-B", "visibility": "list",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+            {"slug": "hidden", "visibility": "hide"}]})
+        a = {"modelsFile": path, "modelLabels": {}, "modelEfforts": {}, "efforts": [], "effortArgs": ["x"]}
+        se.read_models_file(a)
+        self.assertEqual(a["models"], ["", "gpt-a", "gpt-b"])
+        self.assertEqual(a["modelLabels"]["gpt-a"], "GPT-A")
+        self.assertEqual(se.efforts_for(a, "gpt-a"), ["low", "high", "max"])
+        self.assertEqual(se.efforts_for(a, ""), ["low", "high"])
+
+    def test_claude_list_has_aliases_and_pinned_versions(self):
+        claude = se.agent_by_id("claude")
+        for m in ("opus", "opusplan", "opus[1m]", "claude-opus-4-6", "claude-fable-5-1"):
+            self.assertIn(m, claude["models"])
+        self.assertEqual(claude["modelLabels"]["opus"], "Opus · latest")
 
     def test_default_model_adds_no_flag(self):
         argv, _ = se.build_command(make_task(model=""), se.agent_by_id("claude"))
@@ -204,6 +238,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("unknown agent", r.stderr)
         r = self.run_cli("new", "-a", "fake", "-t", "x", "-C", "/does/not/exist")
         self.assertIn("folder does not exist", r.stderr)
+        r = self.run_cli("new", "-a", "fake", "-t", "x", "-e", "high", "-C", TMP)
+        self.assertIn("does not take effort", r.stderr)
 
 
 if __name__ == "__main__":

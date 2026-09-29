@@ -56,11 +56,41 @@ FINISHED = ("exited", "stopped")
 # `codex` notify program, or `watch` (output going quiet). `modelsCommand`
 # asks the agent for its live model list (tab-separated "id<TAB>label" lines);
 # the answer is cached and refreshed in the background.
+# Claude Code has no command that lists models. The aliases track the newest
+# release; the full names pin a version. All of them appear in Claude Code
+# itself (checked against v2.1.284).
+CLAUDE_MODELS = [
+    ("", "Default (your Claude Code setting)"),
+    ("fable", "Fable · latest"),
+    ("opus", "Opus · latest"),
+    ("sonnet", "Sonnet · latest"),
+    ("haiku", "Haiku · latest"),
+    ("opusplan", "Opus plans, Sonnet builds"),
+    ("fable[1m]", "Fable · latest · 1M context"),
+    ("opus[1m]", "Opus · latest · 1M context"),
+    ("sonnet[1m]", "Sonnet · latest · 1M context"),
+    ("claude-fable-5-1", "Fable 5.1"),
+    ("claude-opus-5-5", "Opus 5.5"),
+    ("claude-sonnet-5-5", "Sonnet 5.5"),
+    ("claude-haiku-4-5", "Haiku 4.5"),
+    ("claude-opus-5", "Opus 5"),
+    ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-opus-4-8", "Opus 4.8"),
+    ("claude-opus-4-7", "Opus 4.7"),
+    ("claude-opus-4-6", "Opus 4.6"),
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-opus-4-5", "Opus 4.5"),
+    ("claude-sonnet-4-5", "Sonnet 4.5"),
+    ("claude-opus-4-1", "Opus 4.1"),
+]
+
 AGENTS = [
-    {"id": "claude", "name": "Claude Code", "bin": "claude", "models": ["", "fable", "opus", "sonnet", "haiku"],
-     "modelFlag": "--model", "prompt": "arg", "report": "claude"},
-    {"id": "codex", "name": "Codex", "bin": "codex", "models": [""],
-     "modelFlag": "-m", "prompt": "arg", "report": "codex"},
+    {"id": "claude", "name": "Claude Code", "bin": "claude", "models": [m for m, _ in CLAUDE_MODELS],
+     "modelLabels": dict(CLAUDE_MODELS), "modelFlag": "--model", "prompt": "arg", "report": "claude",
+     "efforts": ["low", "medium", "high", "xhigh", "max"], "effortArgs": ["--effort", "{}"]},
+    {"id": "codex", "name": "Codex", "bin": "codex", "models": [""], "modelsFile": "~/.codex/models_cache.json",
+     "modelFlag": "-m", "prompt": "arg", "report": "codex",
+     "effortArgs": ["-c", 'model_reasoning_effort="{}"']},
     {"id": "antigravity", "name": "Gemini", "bin": "agy", "models": [""], "modelsCommand": ["models"],
      "modelFlag": "--model", "prompt": "flag:-i", "report": "watch"},
     {"id": "opencode", "name": "opencode", "bin": "opencode", "models": [""],
@@ -136,7 +166,11 @@ def agents(cfg=None):
     for a in out:
         a["path"] = shutil.which(a["bin"]) or ""
         a["installed"] = a["path"] != ""
-        a.setdefault("modelLabels", {})
+        a["modelLabels"] = dict(a.get("modelLabels") or {})
+        a.setdefault("efforts", [])
+        a.setdefault("modelEfforts", {})
+        if a.get("modelsFile") and a["installed"]:
+            read_models_file(a)
         if a.get("modelsCommand") and a["installed"]:
             cached = load_json(models_cache_path(a["id"]), {})
             live = [m for m in cached.get("models") or [] if isinstance(m, dict) and m.get("id")]
@@ -145,6 +179,29 @@ def agents(cfg=None):
                 a["modelLabels"] = {m["id"]: m.get("label") or m["id"] for m in live}
             a["modelsFetchedAt"] = cached.get("fetchedAt", 0)
     return out
+
+
+def read_models_file(a):
+    """Codex keeps its own model list (and each model's reasoning levels)."""
+    data = load_json(os.path.expanduser(a["modelsFile"]), {})
+    listed = [m for m in data.get("models") or []
+              if isinstance(m, dict) and m.get("slug") and m.get("visibility", "list") == "list"]
+    if not listed:
+        return
+    a["models"] = [""] + [m["slug"] for m in listed]
+    for m in listed:
+        a["modelLabels"][m["slug"]] = m.get("display_name") or m["slug"]
+        levels = [x.get("effort") for x in m.get("supported_reasoning_levels") or [] if x.get("effort")]
+        if levels:
+            a["modelEfforts"][m["slug"]] = levels
+    # With the model left to Codex, offer only levels every model accepts.
+    sets = [a["modelEfforts"][k] for k in a["modelEfforts"]]
+    if sets:
+        a["efforts"] = [e for e in sets[0] if all(e in x for x in sets[1:])]
+
+
+def efforts_for(agent, model):
+    return agent["modelEfforts"].get(model) or agent["efforts"] if agent.get("effortArgs") else []
 
 
 MODELS_MAX_AGE = 6 * 3600
@@ -376,6 +433,8 @@ def build_command(task, agent):
     extra = task.get("args") or []
     if task.get("model") and agent.get("modelFlag"):
         argv += [agent["modelFlag"], task["model"]]
+    if task.get("effort") and agent.get("effortArgs"):
+        argv += [x.replace("{}", task["effort"]) for x in agent["effortArgs"]]
     if agent["report"] == "claude":
         argv += ["--name", task["title"], "--settings", json.dumps(claude_hooks(task["id"]))]
     elif agent["report"] == "codex":
@@ -418,6 +477,10 @@ def cmd_new(a):
     cwd = os.path.abspath(os.path.expanduser(a.cwd or cfg.get("defaultCwd") or "~"))
     if not os.path.isdir(cwd):
         die(f"folder does not exist: {cwd}")
+    effort = a.effort or ""
+    if effort and effort not in efforts_for(agent, a.model or ""):
+        allowed = ", ".join(efforts_for(agent, a.model or "")) or "none"
+        die(f"{agent['name']} {a.model or 'default'} does not take effort {effort!r} (allowed: {allowed})")
     prompt = a.prompt
     if prompt == "-":
         prompt = sys.stdin.read()
@@ -429,16 +492,17 @@ def cmd_new(a):
         tid = secrets.token_hex(3)
     task = {
         "id": tid, "title": title, "prompt": prompt, "agent": agent["id"], "agentName": agent["name"],
-        "model": a.model or "", "cwd": cwd, "args": a.extra or [], "status": "starting",
+        "model": a.model or "", "effort": effort, "cwd": cwd, "args": a.extra or [], "status": "starting",
         "detail": "", "unseen": False, "createdAt": now(), "updatedAt": now(),
         "exitCode": None, "sessionId": "",
     }
     os.makedirs(TASKS_DIR, exist_ok=True)
     write_json(task_path(tid), task)
-    write_json(PREFS_PATH, {"agent": agent["id"], "model": task["model"], "cwd": cwd})
+    write_json(PREFS_PATH, {"agent": agent["id"], "model": task["model"], "effort": effort, "cwd": cwd})
 
     write_tmux_conf()
-    label = agent["name"] + (f" · {task['model']}" if task["model"] else "")
+    label = " · ".join(x for x in (agent["name"], agent["modelLabels"].get(task["model"], task["model"]),
+                                    effort) if x)
     r = tmux("new-session", "-d", "-s", session(tid), "-c", cwd, "-x", "200", "-y", "50",
              "-e", f"SPEAKEASY_TASK={tid}",
              shlex.join([sys.executable, SELF, "_run", tid]))
@@ -470,9 +534,13 @@ def interactive_new(a, cfg):
     models = agent["models"]
     if len(models) > 1:
         for i, m in enumerate(models, 1):
-            print(f"  {i}. {m or 'default'}")
+            print(f"  {i}. {agent['modelLabels'].get(m) or m or 'default'}")
         pick = input("Model [1]: ").strip() or "1"
         a.model = models[int(pick) - 1]
+    efforts = efforts_for(agent, a.model or "")
+    if efforts:
+        pick = input(f"Effort ({', '.join(efforts)}) [default]: ").strip()
+        a.effort = pick if pick in efforts else ""
     a.agent = agent["id"]
     a.title = input("Title: ").strip()
     print("Describe the task (finish with an empty line):")
@@ -538,6 +606,24 @@ def capture(tid, lines=40):
     return r.stdout if r.returncode == 0 else ""
 
 
+# Start-up screens that stop an agent before it does anything, spotted on its
+# screen: (all these words appear, what to tell the user).
+BLOCKING = [
+    (("hooks need review",), "Codex wants you to review the hooks in ~/.codex/hooks.json (trust them once in Codex to stop this)."),
+    (("trust", "folder"), "Asks whether to trust this folder."),
+    (("trust", "project"), "Asks whether to trust this folder."),
+]
+BLOCKING_MESSAGES = {msg for _, msg in BLOCKING}
+
+
+def blocking_question(screen):
+    low = screen.lower()
+    for words, msg in BLOCKING:
+        if all(w in low for w in words):
+            return msg
+    return ""
+
+
 def watch_quiet(tid, agent, stop):
     """Call the agent 'ready' once its screen stops changing.
 
@@ -555,7 +641,7 @@ def watch_quiet(tid, agent, stop):
             last, changed_at = cur, t
             task = load_task(tid)
             if task and announced and (task.get("status") == "ready" and not hooked
-                                       or task.get("status") == "needs-you" and task.get("detail", "").startswith("Asks whether to trust")):
+                                       or task.get("status") == "needs-you" and task.get("detail", "") in BLOCKING_MESSAGES):
                 update_task(tid, status="running", detail="")
             announced = False
             continue
@@ -565,9 +651,9 @@ def watch_quiet(tid, agent, stop):
         task = load_task(tid)
         if not task:
             continue
-        trust = "trust" in cur.lower() and "folder" in cur.lower() and task.get("status") in ("starting", "running")
-        if trust or (hooked and task.get("status") == "starting"):
-            msg = "Asks whether to trust this folder." if trust else "Waiting on a question before it starts."
+        ask = blocking_question(cur) if task.get("status") in ("starting", "running") else ""
+        if ask or (hooked and task.get("status") == "starting"):
+            msg = ask or "Waiting on a question before it starts."
             task = update_task(tid, status="needs-you", unseen=True, detail=msg)
             notify(task, f"{task['title']} needs you", msg, urgency="critical")
         elif hooked:
@@ -798,9 +884,10 @@ def cmd_state(a):
     out = {
         "version": VERSION,
         "tmux": shutil.which("tmux") is not None,
-        "agents": [{k: x[k] for k in ("id", "name", "models", "modelLabels", "installed", "report")} for x in items],
+        "agents": [dict({k: x[k] for k in ("id", "name", "models", "modelLabels", "installed", "report", "modelEfforts")},
+                        efforts=x["efforts"] if x.get("effortArgs") else []) for x in items],
         "tasks": tasks,
-        "prefs": {"agent": prefs.get("agent", ""), "model": prefs.get("model", ""),
+        "prefs": {"agent": prefs.get("agent", ""), "model": prefs.get("model", ""), "effort": prefs.get("effort", ""),
                   "cwd": prefs.get("cwd") or os.path.expanduser(cfg.get("defaultCwd") or "~")},
     }
     print(json.dumps(out))
@@ -926,6 +1013,7 @@ def main(argv=None):
     s = sub.add_parser("new", help="start a task in a hidden terminal")
     s.add_argument("-a", "--agent", default="claude")
     s.add_argument("-m", "--model", default="")
+    s.add_argument("-e", "--effort", default="", help="reasoning effort, where the agent has one")
     s.add_argument("-t", "--title", default="")
     s.add_argument("-p", "--prompt", default="", help="the task description; '-' reads stdin")
     s.add_argument("-C", "--cwd", default="")

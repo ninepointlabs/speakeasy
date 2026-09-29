@@ -57,14 +57,42 @@ Panel {
   property string confirmId: ""
   readonly property var selectedTask: selected >= 0 && selected < tasks.length ? tasks[selected] : null
 
-  // New-task form. formFocus: 0 agent, 1 model, 2 title, 3 description, 4 folder
+  // New-task form. formFocus: 0 agent, 1 model, 2 effort, 3 title,
+  // 4 description, 5 folder. Rows an agent has no use for are skipped.
   property int agentIndex: 0
   property int modelIndex: 0
-  property int formFocus: 2
+  property string effort: ""
+  property int formFocus: 3
   property bool starting: false
   readonly property var installedAgents: agentList.filter(function(a) { return a.installed })
   readonly property var currentAgent: agentIndex >= 0 && agentIndex < installedAgents.length ? installedAgents[agentIndex] : null
   readonly property var currentModels: currentAgent ? currentAgent.models : []
+  readonly property string currentModel: currentModels[modelIndex] || ""
+  readonly property var currentEfforts: {
+    if (!currentAgent) return []
+    var per = currentAgent.modelEfforts ? currentAgent.modelEfforts[currentModel] : null
+    return per && per.length ? per : (currentAgent.efforts || [])
+  }
+  readonly property var modelOptions: currentModels.map(function(m) { return { value: m, label: root.modelLabel(m) } })
+  readonly property var effortOptions: [{ value: "", label: "Default" }].concat(
+    currentEfforts.map(function(e) { return { value: e, label: e } }))
+
+  // Keep the chosen effort valid when the model changes.
+  onCurrentEffortsChanged: if (effort !== "" && currentEfforts.indexOf(effort) === -1) effort = ""
+
+  function rowVisible(i) {
+    if (i === 1) return currentModels.length > 1
+    if (i === 2) return currentEfforts.length > 0
+    return true
+  }
+  function moveFocus(dir) {
+    var i = formFocus
+    for (var n = 0; n < 6; n++) {
+      i = (i + dir + 6) % 6
+      if (rowVisible(i)) break
+    }
+    setFormFocus(i)
+  }
 
   function applyState(text) {
     var data
@@ -153,10 +181,11 @@ Panel {
     agentIndex = ai
     var mi = currentModels.indexOf(prefs.model || "")
     modelIndex = mi >= 0 ? mi : 0
+    effort = currentEfforts.indexOf(prefs.effort || "") >= 0 ? prefs.effort : ""
     titleField.text = ""
     descArea.text = ""
     folderField.text = prefs.cwd || ""
-    setFormFocus(2)
+    setFormFocus(3)
   }
 
   function showList() {
@@ -166,9 +195,9 @@ Panel {
   }
 
   function setFormFocus(i) {
-    formFocus = Math.max(0, Math.min(4, i))
+    formFocus = Math.max(0, Math.min(5, i))
     Qt.callLater(function() {
-      var target = [formKeys, formKeys, titleField, descArea, folderField][root.formFocus]
+      var target = [formKeys, formKeys, formKeys, titleField, descArea, folderField][root.formFocus]
       if (target) target.forceActiveFocus()
     })
   }
@@ -177,21 +206,31 @@ Panel {
     if (formFocus === 0 && installedAgents.length > 0) {
       agentIndex = (agentIndex + delta + installedAgents.length) % installedAgents.length
       modelIndex = 0
+      effort = ""
     } else if (formFocus === 1 && currentModels.length > 0) {
       modelIndex = (modelIndex + delta + currentModels.length) % currentModels.length
+    } else if (formFocus === 2 && effortOptions.length > 0) {
+      var values = effortOptions.map(function(o) { return o.value })
+      effort = values[(values.indexOf(effort) + delta + values.length) % values.length]
     }
+  }
+
+  // Enter / Space / ↓ on the model or effort row opens its dropdown.
+  function openRowDropdown() {
+    if (formFocus === 1) modelDrop.open()
+    else if (formFocus === 2) effortDrop.open()
   }
 
   function submit() {
     if (!currentAgent || starting) return
     var title = titleField.text.trim()
     var prompt = descArea.text.trim()
-    if (title === "" && prompt === "") { error = "Give the task a title or a description."; setFormFocus(2); return }
+    if (title === "" && prompt === "") { error = "Give the task a title or a description."; setFormFocus(3); return }
     error = ""
     starting = true
     var args = ["new", "--json", "-a", currentAgent.id, "-t", title, "-p", prompt]
-    var model = currentModels[modelIndex] || ""
-    if (model !== "") args.push("-m", model)
+    if (currentModel !== "") args.push("-m", currentModel)
+    if (effort !== "") args.push("-e", effort)
     if (folderField.text.trim() !== "") args.push("-C", folderField.text.trim())
     run(args, function(code, out, err) {
       root.starting = false
@@ -239,7 +278,8 @@ Panel {
       else return "unknown key"
     } else {
       if (name === "esc") showList()
-      else if (name === "tab") setFormFocus(formFocus + 1)
+      else if (name === "tab") moveFocus(1)
+      else if (name === "open") openRowDropdown()
       else if (name === "left") cycleChoice(-1)
       else if (name === "right") cycleChoice(1)
       else if (name === "submit") submit()
@@ -719,8 +759,9 @@ Panel {
             wrapMode: Text.Wrap
           }
 
-          // Agent and model pickers share one key handler: ←/→ choose,
-          // Tab / ↓ move on.
+          // Agent chips and the model / effort dropdowns share one key
+          // handler: ←/→ change the choice in place, Enter / Space / ↓ open
+          // a dropdown (type to filter), Tab moves on.
           FocusScope {
             id: formKeys
             width: parent.width
@@ -729,14 +770,17 @@ Panel {
 
             Keys.onPressed: function(event) {
               var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+              var onDrop = root.formFocus === 1 || root.formFocus === 2
               if (event.key === Qt.Key_Escape) { root.showList(); event.accepted = true }
               else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && ctrl) { root.submit(); event.accepted = true }
               else if (event.key === Qt.Key_Left || event.text === "h") { root.cycleChoice(-1); event.accepted = true }
               else if (event.key === Qt.Key_Right || event.text === "l") { root.cycleChoice(1); event.accepted = true }
-              else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up) { root.setFormFocus(root.formFocus - 1); event.accepted = true }
+              else if (onDrop && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space || event.key === Qt.Key_Down)) {
+                root.openRowDropdown(); event.accepted = true
+              }
+              else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up) { root.moveFocus(-1); event.accepted = true }
               else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                root.setFormFocus(root.formFocus === 0 && root.currentModels.length <= 1 ? 2 : root.formFocus + 1)
-                event.accepted = true
+                root.moveFocus(1); event.accepted = true
               }
             }
 
@@ -745,56 +789,46 @@ Panel {
               width: parent.width
               spacing: Style.space(8)
 
-              Repeater {
-                model: [0, 1]
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
 
-                Row {
-                  id: pickRow
-                  required property int modelData
-                  readonly property bool isAgents: modelData === 0
-                  readonly property bool focused: formKeys.activeFocus && root.formFocus === modelData
-                  readonly property var choices: isAgents ? root.installedAgents : root.currentModels
-                  visible: isAgents || root.currentModels.length > 1
-                  width: parent.width
+                Text {
+                  id: agentLabel
+                  width: Style.space(84)
+                  topPadding: Style.space(4)
+                  textFormat: Text.PlainText
+                  text: "Agent"
+                  color: formKeys.activeFocus && root.formFocus === 0 ? root.accent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: formKeys.activeFocus && root.formFocus === 0
+                }
+
+                Flow {
+                  width: parent.width - agentLabel.width - parent.spacing
                   spacing: Style.space(6)
 
-                  Text {
-                    id: pickLabel
-                    width: Style.space(84)
-                    topPadding: Style.space(4)
-                    textFormat: Text.PlainText
-                    text: pickRow.isAgents ? "Agent" : "Model"
-                    color: pickRow.focused ? root.accent : root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: pickRow.focused
-                  }
-
-                  // Chips wrap: Antigravity alone offers a dozen models.
-                  Flow {
-                    width: pickRow.width - pickLabel.width - pickRow.spacing
-                    spacing: Style.space(6)
-
                   Repeater {
-                    model: pickRow.choices
+                    model: root.installedAgents
 
                     Rectangle {
                       id: chip
                       required property var modelData
                       required property int index
-                      readonly property bool chosen: pickRow.isAgents ? index === root.agentIndex : index === root.modelIndex
+                      readonly property bool chosen: index === root.agentIndex
                       radius: Style.cornerRadius
                       implicitWidth: chipText.implicitWidth + Style.space(18)
                       implicitHeight: chipText.implicitHeight + Style.space(8)
                       color: chosen ? Style.hoverFillFor(root.foreground, root.accent) : "transparent"
                       border.width: chosen ? Math.max(1, Style.space(2)) : Style.spacing.hairline
-                      border.color: chosen ? (pickRow.focused ? root.accent : root.dim) : Style.normalBorderFor(root.foreground, root.accent)
+                      border.color: chosen ? (formKeys.activeFocus && root.formFocus === 0 ? root.accent : root.dim) : Style.normalBorderFor(root.foreground, root.accent)
 
                       Text {
                         id: chipText
                         anchors.centerIn: parent
                         textFormat: Text.PlainText
-                        text: pickRow.isAgents ? chip.modelData.name : root.modelLabel(chip.modelData)
+                        text: chip.modelData.name
                         color: chip.chosen ? root.foreground : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
@@ -805,14 +839,83 @@ Panel {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
-                          if (pickRow.isAgents) { root.agentIndex = chip.index; root.modelIndex = 0 }
-                          else root.modelIndex = chip.index
-                          root.setFormFocus(pickRow.modelData)
+                          root.agentIndex = chip.index
+                          root.modelIndex = 0
+                          root.effort = ""
+                          root.setFormFocus(0)
                         }
                       }
                     }
                   }
+                }
+              }
+
+              Row {
+                visible: root.rowVisible(1)
+                width: parent.width
+                spacing: Style.space(6)
+
+                Text {
+                  id: modelLabelText
+                  width: Style.space(84)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: "Model"
+                  color: formKeys.activeFocus && root.formFocus === 1 ? root.accent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: formKeys.activeFocus && root.formFocus === 1
+                }
+
+                SearchableDropdown {
+                  id: modelDrop
+                  width: parent.width - modelLabelText.width - parent.spacing
+                  showLabel: false
+                  options: root.modelOptions
+                  value: root.currentModel
+                  placeholderText: "Type to filter models…"
+                  hasCursor: formKeys.activeFocus && root.formFocus === 1
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onChanged: function(v) {
+                    var i = root.currentModels.indexOf(v)
+                    if (i >= 0) root.modelIndex = i
+                    root.setFormFocus(1)
                   }
+                  onPopupOpenChanged: if (!popupOpen && root.view === "new" && root.formFocus === 1) root.setFormFocus(1)
+                }
+              }
+
+              Row {
+                visible: root.rowVisible(2)
+                width: parent.width
+                spacing: Style.space(6)
+
+                Text {
+                  id: effortLabelText
+                  width: Style.space(84)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: "Effort"
+                  color: formKeys.activeFocus && root.formFocus === 2 ? root.accent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: formKeys.activeFocus && root.formFocus === 2
+                }
+
+                Dropdown {
+                  id: effortDrop
+                  width: Style.space(220)
+                  showLabel: false
+                  options: root.effortOptions
+                  value: root.effort
+                  hasCursor: formKeys.activeFocus && root.formFocus === 2
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onChanged: function(v) { root.effort = v; root.setFormFocus(2) }
+                  onPopupOpenChanged: if (!popupOpen && root.view === "new" && root.formFocus === 2) root.setFormFocus(2)
                 }
               }
             }
@@ -832,11 +935,11 @@ Panel {
             foreground: root.foreground
             accent: root.accent
             font.family: root.fontFamily
-            onActiveFocusChanged: if (activeFocus) root.formFocus = 2
-            Keys.onReturnPressed: function(event) { if (event.modifiers & Qt.ControlModifier) root.submit(); else root.setFormFocus(3) }
-            Keys.onEnterPressed: function(event) { if (event.modifiers & Qt.ControlModifier) root.submit(); else root.setFormFocus(3) }
-            Keys.onTabPressed: root.setFormFocus(3)
-            Keys.onBacktabPressed: root.setFormFocus(root.currentModels.length > 1 ? 1 : 0)
+            onActiveFocusChanged: if (activeFocus) root.formFocus = 3
+            Keys.onReturnPressed: function(event) { if (event.modifiers & Qt.ControlModifier) root.submit(); else root.setFormFocus(4) }
+            Keys.onEnterPressed: function(event) { if (event.modifiers & Qt.ControlModifier) root.submit(); else root.setFormFocus(4) }
+            Keys.onTabPressed: root.moveFocus(1)
+            Keys.onBacktabPressed: root.moveFocus(-1)
             Keys.onEscapePressed: root.showList()
           }
 
@@ -869,12 +972,12 @@ Panel {
                 wrapMode: TextEdit.Wrap
                 selectByMouse: true
                 background: null
-                onActiveFocusChanged: if (activeFocus) root.formFocus = 3
+                onActiveFocusChanged: if (activeFocus) root.formFocus = 4
                 Keys.onPressed: function(event) {
                   var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
                   if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && ctrl) { root.submit(); event.accepted = true }
-                  else if (event.key === Qt.Key_Tab) { root.setFormFocus(4); event.accepted = true }
-                  else if (event.key === Qt.Key_Backtab) { root.setFormFocus(2); event.accepted = true }
+                  else if (event.key === Qt.Key_Tab) { root.moveFocus(1); event.accepted = true }
+                  else if (event.key === Qt.Key_Backtab) { root.moveFocus(-1); event.accepted = true }
                   else if (event.key === Qt.Key_Escape) { root.showList(); event.accepted = true }
                 }
               }
@@ -895,11 +998,11 @@ Panel {
             foreground: root.foreground
             accent: root.accent
             font.family: root.fontFamily
-            onActiveFocusChanged: if (activeFocus) root.formFocus = 4
+            onActiveFocusChanged: if (activeFocus) root.formFocus = 5
             Keys.onReturnPressed: root.submit()
             Keys.onEnterPressed: root.submit()
-            Keys.onTabPressed: root.setFormFocus(0)
-            Keys.onBacktabPressed: root.setFormFocus(3)
+            Keys.onTabPressed: root.moveFocus(1)
+            Keys.onBacktabPressed: root.moveFocus(-1)
             Keys.onEscapePressed: root.showList()
           }
 
@@ -946,7 +1049,7 @@ Panel {
           width: parent.width
           textFormat: Text.PlainText
           text: root.view === "new"
-            ? "Tab next field  ·  ←→ choose  ·  Ctrl+Enter start  ·  Esc back"
+            ? "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back"
             : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear finished  ·  Esc close"
                                      : "n new  ·  Esc close")
           color: root.faint
