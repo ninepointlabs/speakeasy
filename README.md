@@ -1,6 +1,6 @@
 # Speakeasy
 
-The back room for your AI agents. Hand Claude Code, Codex or another coding
+The back room for your AI agents. Hand Claude Code, Codex, Gemini or another coding
 agent a task, give it a name, and it works in a terminal you never have to
 look at. The bar tells you which tasks are working, which are done and which
 need you; a notification taps you on the shoulder when one wants an approval
@@ -78,10 +78,14 @@ Omarchy shell they open a terminal with the interactive prompts or the list.
 |--------------|------------------------------------|-------------------------------|
 | Claude Code  | default, fable, opus, sonnet, haiku | hooks (approval, done, working) |
 | Codex        | default                            | `notify` (turn finished) + quiet screen |
-| Gemini CLI   | default                            | quiet screen |
+| Gemini (Antigravity CLI, `agy`) | whatever `agy models` lists for your account, refreshed every 6 hours | quiet screen |
 | opencode     | default                            | quiet screen |
-| Cursor Agent | default                            | quiet screen |
+| Cursor Agent | default, composer-2.5, composer-2.5-fast, gpt-5.5, sonnet-4, opus | quiet screen |
 | Crush        | default                            | quiet screen; the prompt is typed in |
+
+`speakeasy models` prints every agent's list; `speakeasy models antigravity
+--refresh` asks Antigravity again right away. Google's older Gemini CLI is no
+longer listed by default; add it in the config if you want it back.
 
 Add models or agents in `~/.config/speakeasy/config.json`:
 

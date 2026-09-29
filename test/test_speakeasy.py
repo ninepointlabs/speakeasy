@@ -95,7 +95,8 @@ class Pure(unittest.TestCase):
         self.assertEqual(json.loads(notify[len("notify="):])[-2:], ["abc123", "codex"])
 
     def test_prompt_delivery_modes(self):
-        argv, _ = se.build_command(make_task(agent="gemini"), se.agent_by_id("gemini"))
+        argv, _ = se.build_command(make_task(agent="antigravity", model="gemini-3.8-flash-low"), se.agent_by_id("antigravity"))
+        self.assertIn("--model", argv)
         self.assertEqual(argv[-2:], ["-i", "fix it"])
         argv, typed = se.build_command(make_task(agent="crush"), se.agent_by_id("crush"))
         self.assertNotIn("fix it", argv)
@@ -132,6 +133,29 @@ class Hooks(unittest.TestCase):
         self.assertEqual(t["status"], "running")
         t = hook("abc123", "codex", argv_payload={"type": "agent-turn-complete", "last-assistant-message": "Fixed it."})
         self.assertEqual((t["status"], t["detail"]), ("ready", "Fixed it."))
+
+
+class Models(unittest.TestCase):
+    def test_live_models_parse_and_cache(self):
+        lister = os.path.join(TMP, "fake-lister")
+        with open(lister, "w") as f:
+            f.write('#!/bin/sh\necho "Fetching available models..."\n'
+                    'printf "gem-fast\\tGem Fast (Low)\\ngem-pro\\tGem Pro\\n"\n')
+        os.chmod(lister, 0o755)
+        agent = {"id": "lister", "name": "Lister", "path": lister, "modelsCommand": []}
+        models = se.fetch_models(agent)
+        self.assertEqual([m["id"] for m in models], ["gem-fast", "gem-pro"])
+        self.assertEqual(models[0]["label"], "Gem Fast (Low)")
+        cached = se.load_json(se.models_cache_path("lister"), {})
+        self.assertEqual(len(cached["models"]), 2)
+
+    def test_failed_listing_keeps_the_old_cache(self):
+        agent = {"id": "broken", "name": "Broken", "path": "/bin/false", "modelsCommand": []}
+        self.assertIsNone(se.fetch_models(agent))
+        self.assertFalse(os.path.exists(se.models_cache_path("broken")))
+
+    def test_cursor_has_a_fixed_list(self):
+        self.assertIn("composer-2.5", se.agent_by_id("cursor-agent")["models"])
 
 
 class State(unittest.TestCase):

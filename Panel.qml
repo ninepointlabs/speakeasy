@@ -243,6 +243,7 @@ Panel {
       else if (name === "left") cycleChoice(-1)
       else if (name === "right") cycleChoice(1)
       else if (name === "submit") submit()
+      else if (name.indexOf("focus:") === 0) setFormFocus(Number(name.slice(6)))
       else if (name.indexOf("title:") === 0) titleField.text = name.slice(6)
       else if (name.indexOf("desc:") === 0) descArea.text = name.slice(5)
       else if (name.indexOf("folder:") === 0) folderField.text = name.slice(7)
@@ -298,7 +299,11 @@ Panel {
               "exited": "ended", "stopped": "stopped" })[s] || s
   }
 
-  function modelLabel(m) { return m === "" ? "default" : m }
+  function modelLabel(m) {
+    if (m === "") return "default"
+    var labels = currentAgent && currentAgent.modelLabels ? currentAgent.modelLabels : ({})
+    return labels[m] || m
+  }
 
   readonly property string subtitle: {
     if (!loaded) return "Loading…"
@@ -707,7 +712,7 @@ Panel {
             visible: root.installedAgents.length === 0
             width: parent.width
             textFormat: Text.PlainText
-            text: "No supported agent is installed. Speakeasy knows Claude Code, Codex, Gemini CLI, opencode, Cursor Agent and Crush; others can be added in ~/.config/speakeasy/config.json."
+            text: "No supported agent is installed. Speakeasy knows Claude Code, Codex, Gemini (Antigravity CLI), opencode, Cursor Agent and Crush; others can be added in ~/.config/speakeasy/config.json."
             color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -754,15 +759,21 @@ Panel {
                   spacing: Style.space(6)
 
                   Text {
+                    id: pickLabel
                     width: Style.space(84)
+                    topPadding: Style.space(4)
                     textFormat: Text.PlainText
                     text: pickRow.isAgents ? "Agent" : "Model"
                     color: pickRow.focused ? root.accent : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     font.bold: pickRow.focused
-                    anchors.verticalCenter: parent.verticalCenter
                   }
+
+                  // Chips wrap: Antigravity alone offers a dozen models.
+                  Flow {
+                    width: pickRow.width - pickLabel.width - pickRow.spacing
+                    spacing: Style.space(6)
 
                   Repeater {
                     model: pickRow.choices
@@ -800,6 +811,7 @@ Panel {
                         }
                       }
                     }
+                  }
                   }
                 }
               }
