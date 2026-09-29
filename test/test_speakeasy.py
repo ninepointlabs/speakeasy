@@ -295,6 +295,56 @@ class Privacy(unittest.TestCase):
         self.assertEqual(se.blocking_question("› Ask Codex to do anything\n  ? for shortcuts"), "")
 
 
+class Clear(unittest.TestCase):
+    def clear(self, *extra):
+        out = io.StringIO()
+        old, sys.stdout = sys.stdout, out
+        try:
+            se.main(["clear", "--json", *extra])
+        finally:
+            sys.stdout = old
+        return json.loads(out.getvalue())
+
+    def setUp(self):
+        # Done and active tasks have live terminals (a done agent waits for
+        # your next message); ended and stopped ones do not.
+        self._live = se.live_sessions
+        self.alive = {"se-c00001": False, "se-c00004": False, "se-c00006": False, "se-c00007": False}
+        se.live_sessions = lambda: dict(self.alive)
+        for t in se.all_tasks():
+            os.remove(se.task_path(t["id"]))
+        make_task(tid="c00001", status="ready", unseen=False)    # done, checked
+        make_task(tid="c00002", status="exited", unseen=False)   # ended, checked
+        make_task(tid="c00003", status="stopped", unseen=False)  # stopped
+        make_task(tid="c00004", status="ready", unseen=True)     # done, not looked at
+        make_task(tid="c00005", status="exited", unseen=True)    # ended, not looked at
+        make_task(tid="c00006", status="running")
+        make_task(tid="c00007", status="needs-you", unseen=True)
+
+    def tearDown(self):
+        se.live_sessions = self._live
+
+    def ids(self):
+        return sorted(t["id"] for t in se.all_tasks())
+
+    def test_a_vanished_terminal_counts_as_unchecked(self):
+        del self.alive["se-c00006"]   # c00006's terminal is gone (a reboot, say)
+        self.assertEqual(self.clear(), {"removed": 3, "kept": 3})
+        self.assertIn("c00006", self.ids())
+
+    def test_default_keeps_unchecked_and_active(self):
+        self.assertEqual(self.clear(), {"removed": 3, "kept": 2})
+        self.assertEqual(self.ids(), ["c00004", "c00005", "c00006", "c00007"])
+
+    def test_include_unchecked_still_keeps_active(self):
+        self.assertEqual(self.clear("--include-unchecked"), {"removed": 5, "kept": 0})
+        self.assertEqual(self.ids(), ["c00006", "c00007"])
+
+    def test_opening_or_marking_seen_makes_it_clearable(self):
+        se.main(["seen", "c00004"])
+        self.assertEqual(self.clear(), {"removed": 4, "kept": 1})
+
+
 class Dirs(unittest.TestCase):
     def dirs(self, text):
         out = io.StringIO()

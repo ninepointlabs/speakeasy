@@ -493,7 +493,8 @@ def reconcile(tasks):
         t["alive"] = session(t["id"]) in sessions
         t["attached"] = sessions.get(session(t["id"]), False)
         if t.get("status") in LIVE and session(t["id"]) not in sessions:
-            nt = update_task(t["id"], status="exited", detail="The terminal session is gone.")
+            # Nobody saw how it ended, so it stays unchecked (and is kept by `clear`).
+            nt = update_task(t["id"], status="exited", detail="The terminal session is gone.", unseen=True)
             if nt:
                 t.update(nt)
                 t["alive"] = t["attached"] = False
@@ -1235,20 +1236,35 @@ def cmd_rm(a):
     bump_rev()
 
 
+# Completed: the agent finished its turn (ready), ended, or was stopped.
+COMPLETED = ("ready",) + FINISHED
+
+
 def cmd_clear(a):
-    """Remove every finished task (exited or stopped)."""
-    n = 0
+    """Remove completed tasks. Ones whose results you have not looked at yet
+    (never opened or peeked, still marked unseen) are kept unless asked."""
+    removed, kept = 0, 0
     for t in reconcile(all_tasks()):
-        if t.get("status") in FINISHED:
-            tmux("kill-session", "-t", session(t["id"]))
-            for p in (task_path(t["id"]), task_path(t["id"]) + ".lock"):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-            n += 1
+        if t.get("status") not in COMPLETED:
+            continue
+        if t.get("unseen") and not a.include_unchecked:
+            kept += 1
+            continue
+        tmux("kill-session", "-t", session(t["id"]))
+        for p in (task_path(t["id"]), task_path(t["id"]) + ".lock"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        removed += 1
     bump_rev()
-    print(f"Removed {n} finished task{'s' if n != 1 else ''}.")
+    if a.json:
+        print(json.dumps({"removed": removed, "kept": kept}))
+        return
+    msg = f"Removed {removed} completed task{'s' if removed != 1 else ''}."
+    if kept:
+        msg += f" Kept {kept} you haven't checked yet (open or peek them first, or use --include-unchecked)."
+    print(msg)
 
 
 PLUGIN_ID = "ninepointlabs.speakeasy"
@@ -1332,7 +1348,9 @@ def main(argv=None):
     s.add_argument("ref")
     s.set_defaults(fn=cmd_rm)
 
-    s = sub.add_parser("clear", help="remove every finished task")
+    s = sub.add_parser("clear", help="remove completed tasks you have checked (opened or peeked)")
+    s.add_argument("--include-unchecked", action="store_true", help="also remove completed tasks you have not looked at")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_clear)
 
     s = sub.add_parser("agents", help="show supported agents; --hide/--show one in the new-task picker")

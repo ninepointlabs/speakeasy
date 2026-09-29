@@ -51,7 +51,13 @@ Panel {
   readonly property int needsCount: countWhere(function(t) { return t.status === "needs-you" })
   readonly property int doneCount: countWhere(function(t) { return t.status !== "needs-you" && t.unseen === true })
   readonly property int workingCount: countWhere(function(t) { return t.status === "running" || t.status === "starting" })
-  readonly property int finishedCount: countWhere(function(t) { return t.status === "exited" || t.status === "stopped" })
+  // Completed = done, ended or stopped. "Checked" = you opened or peeked it
+  // (no longer unseen); only checked ones are cleared unless you insist.
+  function isCompleted(t) { return t.status === "ready" || t.status === "exited" || t.status === "stopped" }
+  readonly property int clearableCount: countWhere(function(t) { return root.isCompleted(t) && t.unseen !== true })
+  readonly property int uncheckedDoneCount: countWhere(function(t) { return root.isCompleted(t) && t.unseen === true })
+  property bool confirmClearAll: false
+  property string notice: ""
 
   function countWhere(pred) {
     var n = 0
@@ -244,8 +250,32 @@ Panel {
     run([finished ? "rm" : "stop", t.id])
   }
 
-  function clearFinished() {
-    if (finishedCount > 0) run(["clear"])
+  function clearDone() {
+    confirmClearAll = false
+    if (clearableCount === 0) {
+      notice = uncheckedDoneCount > 0
+        ? uncheckedDoneCount + " completed " + (uncheckedDoneCount === 1 ? "task hasn't" : "tasks haven't") + " been checked yet. Open or peek to check, or Shift+C to clear anyway."
+        : "Nothing completed to clear."
+      return
+    }
+    run(["clear", "--json"], function(code, out, err) {
+      if (code !== 0) { root.error = err || "Could not clear."; return }
+      var r = ({}); try { r = JSON.parse(out) } catch (e) {}
+      root.notice = "Cleared " + (r.removed || 0) + "." + (r.kept ? " Kept " + r.kept + " you haven't checked yet (Shift+C clears those too)." : "")
+    })
+  }
+
+  // Shift+C: everything completed, checked or not, after a confirmation.
+  function clearAllDone() {
+    var total = clearableCount + uncheckedDoneCount
+    if (total === 0) { notice = "Nothing completed to clear."; return }
+    if (!confirmClearAll) { confirmClearAll = true; notice = ""; return }
+    confirmClearAll = false
+    run(["clear", "--include-unchecked", "--json"], function(code, out, err) {
+      if (code !== 0) { root.error = err || "Could not clear."; return }
+      var r = ({}); try { r = JSON.parse(out) } catch (e) {}
+      root.notice = "Cleared " + (r.removed || 0) + ", including ones you hadn't checked."
+    })
   }
 
   function togglePeek() {
@@ -257,6 +287,7 @@ Panel {
   function refreshPeek() {
     var t = selectedTask
     if (!t || peekProc.running) return
+    peekProc.taskId = t.id
     peekProc.command = [cli, "peek", t.id, "-n", "14"]
     peekProc.running = true
   }
@@ -401,7 +432,8 @@ Panel {
       else if (name === "n") showNew()
       else if (name === "p") togglePeek()
       else if (name === "x") stopOrRemove()
-      else if (name === "c") clearFinished()
+      else if (name === "c") clearDone()
+      else if (name === "C") clearAllDone()
       else if (name === "esc") { if (confirmId !== "") confirmId = ""; else dismiss() }
       else return "unknown key"
     } else {
@@ -532,6 +564,8 @@ Panel {
 
   function onShown() {
     confirmId = ""
+    confirmClearAll = false
+    notice = ""
     view = "list"
     error = ""
     refresh()
@@ -635,8 +669,17 @@ Panel {
     id: peekProc
     environment: root.procEnv
     running: false
+    property string taskId: ""
     stdout: StdioCollector { id: peekOut }
-    onExited: function(code) { root.peekText = code === 0 ? peekOut.text.replace(/\s+$/, "") : "" }
+    onExited: function(code) {
+      root.peekText = code === 0 ? peekOut.text.replace(/\s+$/, "") : ""
+      // Peeking at a completed task's result counts as checking it.
+      if (code !== 0) return
+      for (var i = 0; i < root.tasks.length; i++) {
+        var t = root.tasks[i]
+        if (t.id === peekProc.taskId && t.unseen === true && root.isCompleted(t)) { root.run(["seen", t.id]); break }
+      }
+    }
   }
 
   property bool pendingNew: false
@@ -682,6 +725,8 @@ Panel {
       blocked: root.view === "new" || cwdField.activeFocus
       onCloseRequested: {
         if (root.view === "settings") { root.showList(); return }
+        if (root.confirmClearAll) { root.confirmClearAll = false; return }
+        if (root.notice !== "") { root.notice = ""; return }
         if (root.confirmId !== "") { root.confirmId = ""; return }
         if (root.peekOn) { root.peekOn = false; return }
         root.dismiss()
@@ -694,6 +739,7 @@ Panel {
       }
       onActivateRequested: {
         if (root.view === "settings") root.activateSetting()
+        else if (root.confirmClearAll) root.clearAllDone()
         else if (root.confirmId !== "") root.stopOrRemove()
         else root.openSelected()
       }
@@ -703,7 +749,9 @@ Panel {
         if (t === "n" || t === "N") root.showNew()
         else if (t === "s" || t === "S") root.showSettings()
         else if (t === "p" || t === "P") root.togglePeek()
-        else if (t === "c" || t === "C") root.clearFinished()
+        else if (t === "c") root.clearDone()
+        else if (t === "C") root.clearAllDone()
+        else if (t === "y" && root.confirmClearAll) root.clearAllDone()
         else if (t === "y" && root.confirmId !== "") root.stopOrRemove()
       }
 
@@ -779,16 +827,16 @@ Panel {
               onClicked: root.showSettings()
             }
             Button {
-              visible: root.view === "list" && root.finishedCount > 0
-              text: "Clear finished"
-              tooltipText: "Remove every ended or stopped task (c)"
+              visible: root.view === "list" && (root.clearableCount > 0 || root.uncheckedDoneCount > 0)
+              text: root.clearableCount > 0 ? "Clear done (" + root.clearableCount + ")" : "Clear done"
+              tooltipText: "Remove completed tasks you've checked (c). Unchecked ones stay; Shift+C clears them too."
               foreground: root.dim
               accent: root.accent
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               horizontalPadding: Style.space(8)
               verticalPadding: Style.space(3)
-              onClicked: root.clearFinished()
+              onClicked: root.clearDone()
             }
             Button {
               visible: root.view === "list"
@@ -1473,6 +1521,22 @@ Panel {
           }
         }
 
+        // -------------------------------------------------------- notice --
+        Text {
+          visible: root.view === "list" && (root.notice !== "" || root.confirmClearAll)
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.confirmClearAll
+            ? ((root.clearableCount + root.uncheckedDoneCount) === 1 ? "Clear the completed task" : "Clear all " + (root.clearableCount + root.uncheckedDoneCount) + " completed tasks")
+              + (root.uncheckedDoneCount === 0 ? "" : (root.clearableCount + root.uncheckedDoneCount) === 1 ? ", which you haven't checked" : ", including " + root.uncheckedDoneCount + " you haven't checked")
+              + "? Shift+C, Enter or y to confirm, Esc to cancel"
+            : root.notice
+          color: root.confirmClearAll ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+
         // --------------------------------------------------------- error --
         Text {
           visible: root.error !== ""
@@ -1495,7 +1559,7 @@ Panel {
                : "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back")
             : root.view === "settings"
               ? "↑↓ pick  ·  Enter or Space toggle / edit  ·  Enter saves the folder  ·  Esc back"
-              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear finished  ·  s settings  ·  Esc close"
+              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear done  ·  s settings  ·  Esc close"
                                        : "n new  ·  s settings  ·  Esc close")
           color: root.faint
           font.family: root.fontFamily

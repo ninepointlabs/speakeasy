@@ -150,7 +150,8 @@ first line of the answer.
 | `n` | New task |
 | `p` | Peek: the last lines of its screen, updated live |
 | `x` | Stop a running task, or remove an ended one; press `x`, `Enter` or `y` again to confirm |
-| `c` | Clear every ended task |
+| `c` | Clear completed tasks (done, ended or stopped) that you have checked. A task you haven't opened or peeked at yet keeps its ● and stays |
+| `Shift+C` | Clear every completed task, checked or not, after a confirmation |
 | `s` | Settings |
 | `Esc` | Cancel a confirmation, close the peek, then close the panel |
 
@@ -254,7 +255,8 @@ speakeasy send login "yes, go ahead"          # type a line into it and press En
 speakeasy rename login "Fix the login loop"
 speakeasy stop login                          # stop, keep it in the list
 speakeasy rm login                            # stop and remove
-speakeasy clear                               # remove every ended task
+speakeasy clear                               # remove completed tasks you've checked (opened or peeked)
+speakeasy clear --include-unchecked           # ...and the ones you haven't looked at yet
 speakeasy agents                              # which agents are installed, which are hidden
 speakeasy agents --hide crush --show codex    # choose what the new-task picker offers
 speakeasy set notify off                      # also: default-cwd PATH, quiet-seconds N, terminal CMD
