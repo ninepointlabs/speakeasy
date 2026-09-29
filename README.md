@@ -93,6 +93,13 @@ cd ~/Projects/speakeasy
 of the bar, and links `~/.local/bin/speakeasy` so the command is on your
 `PATH`. Re-run it after pulling changes.
 
+It only replaces what it put there itself. It stops without changing
+anything if `~/.local/bin/speakeasy` is something else, if the plugin folder
+is a symlink, not yours, or not a Speakeasy install, or if it is a git
+checkout made by `omarchy plugin add` (update that with `omarchy plugin
+update ninepointlabs.speakeasy`). The new copy is staged, validated and
+swapped in with a rename that rolls back on failure.
+
 ### Put the command on your PATH (marketplace installs)
 
 The panel does not need this, but the command line is handy:
@@ -208,7 +215,7 @@ while the panel is open), so an agent you install shows up by itself.
 | GitHub Copilot (`copilot`) | The agent's default | none to max | Quiet screen |
 | Hermes (`hermes`) | The agent's default (runs `hermes chat`) | — | Quiet screen |
 | Cursor Agent (`cursor-agent`) | default, composer-2.5, composer-2.5-fast, gpt-5.5, sonnet-4, opus | — | Quiet screen |
-| opencode, Crush | The agent's default (add more in the config) | — | Quiet screen (Crush's prompt is typed in for you) |
+| opencode, Crush | The agent's default (add more in the config) | — | Quiet screen |
 
 "Quiet screen" means the task counts as done, or waiting for you, once its
 output has not changed for 20 seconds (configurable). It is a good guess, not
@@ -301,9 +308,11 @@ Optional, in `~/.config/speakeasy/config.json`:
 | `hiddenAgents` | Agent ids left out of the new-task picker (Settings changes this) |
 
 An agent entry takes `name`, `bin`, `models` (`""` is the agent's default),
-`modelLabels`, `modelFlag` (passed as `<flag>=<model>`), and `prompt`: `arg`
-(the prompt is the last argument, after `--`), `flag:<name>` (passed as
-`<name>=<prompt>`), or `keys` (typed into the agent once its screen settles).
+`modelLabels`, `modelFlag` (passed as `<flag>=<model>`), and `prompt`: `keys`
+(the default: typed into the agent once it is ready), `arg` (the last
+argument, after `--`), or `flag:<name>` (passed as `<name>=<prompt>`). `arg`
+and `flag:` put the prompt in the agent's process arguments, where other
+users on the machine can see it; every built-in agent uses `keys`.
 
 ## How it works
 
@@ -327,6 +336,17 @@ An agent entry takes `name`, `bin`, `models` (`""` is the agent's default),
 
 - Nothing leaves your machine except what the agents themselves send. Speakeasy
   makes no network requests of its own.
+- Task records hold your prompts, so Speakeasy's folders are created `0700`
+  and its files `0600`: other users on the machine cannot read them. Folders
+  and files left by version 0.1 are tightened on the next run.
+- Prompts and titles never appear in a process's arguments (which any user can
+  see with `ps`). Speakeasy types the prompt into the agent's terminal through
+  a tmux paste buffer fed on stdin, once the agent is ready: after any trust,
+  sign-in or other question on its screen has been answered, so a prompt is
+  never typed into a menu. Notification text reaches the notifier over stdin
+  and D-Bus in the same way. One exception is outside Speakeasy's hands:
+  Codex hands its turn summary to Speakeasy's hook as an argument (that is
+  how Codex's `notify` works); the hook reads it and exits at once.
 - Every program is started with an argument list, never through a shell.
   Titles, descriptions and model names are passed as `--flag=value` or after
   `--`, so text that starts with `-` can never turn into an agent option.

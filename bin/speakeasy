@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SOCKET = "speakeasy"
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "speakeasy")
@@ -88,30 +88,30 @@ CLAUDE_MODELS = [
 
 AGENTS = [
     {"id": "claude", "name": "Claude Code", "bin": "claude", "models": [m for m, _ in CLAUDE_MODELS],
-     "modelLabels": dict(CLAUDE_MODELS), "modelFlag": "--model", "prompt": "arg", "report": "claude",
+     "modelLabels": dict(CLAUDE_MODELS), "modelFlag": "--model", "prompt": "keys", "report": "claude",
      "efforts": ["low", "medium", "high", "xhigh", "max"], "effortArgs": ["--effort={}"]},
     {"id": "codex", "name": "Codex", "bin": "codex", "models": [""], "modelsFile": "~/.codex/models_cache.json",
-     "modelFlag": "--model", "prompt": "arg", "report": "codex",
+     "modelFlag": "--model", "prompt": "keys", "report": "codex",
      "effortArgs": ["-c", 'model_reasoning_effort="{}"']},
     {"id": "antigravity", "name": "Gemini", "bin": "agy", "models": [""], "modelsCommand": ["models"],
-     "modelFlag": "--model", "prompt": "flag:-i", "report": "watch"},
+     "modelFlag": "--model", "prompt": "keys", "report": "watch"},
     {"id": "opencode", "name": "opencode", "bin": "opencode", "models": [""],
-     "modelFlag": "--model", "prompt": "flag:--prompt", "report": "watch"},
+     "modelFlag": "--model", "prompt": "keys", "report": "watch"},
     {"id": "cursor-agent", "name": "Cursor Agent", "bin": "cursor-agent",
      "models": ["", "composer-2.5", "composer-2.5-fast", "gpt-5.5", "sonnet-4", "opus"],
-     "modelFlag": "--model", "prompt": "arg", "report": "watch"},
+     "modelFlag": "--model", "prompt": "keys", "report": "watch"},
     {"id": "crush", "name": "Crush", "bin": "crush", "models": [""],
      "modelFlag": None, "prompt": "keys", "report": "watch"},
     {"id": "muse", "name": "Muse", "bin": "muse", "models": [""],
      "modelsFile": "~/.local/share/muse/model-catalog/*.json", "modelsFormat": "muse",
-     "modelFlag": "--model", "prompt": "arg", "report": "watch", "effortArgs": ["--reasoning-effort={}"]},
+     "modelFlag": "--model", "prompt": "keys", "report": "watch", "effortArgs": ["--reasoning-effort={}"]},
     {"id": "copilot", "name": "GitHub Copilot", "bin": "copilot", "models": [""],
-     "modelFlag": "--model", "prompt": "flag:--interactive", "report": "watch",
+     "modelFlag": "--model", "prompt": "keys", "report": "watch",
      "efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "effortArgs": ["--reasoning-effort={}"]},
     {"id": "grok", "name": "Grok", "bin": "grok", "models": [""], "modelsCommand": ["models"], "modelsParse": "bullets",
-     "modelFlag": "--model", "prompt": "arg", "report": "watch"},
+     "modelFlag": "--model", "prompt": "keys", "report": "watch"},
     {"id": "hermes", "name": "Hermes", "bin": "hermes", "baseArgs": ["chat"], "models": [""],
-     "modelFlag": "--model", "prompt": "flag:--query", "report": "watch"},
+     "modelFlag": "--model", "prompt": "keys", "report": "watch"},
 ]
 
 DEFAULT_CONFIG = {
@@ -145,13 +145,45 @@ def load_json(path, fallback):
         return fallback
 
 
+# Task records hold prompts, so everything Speakeasy writes is private to the
+# user: folders 0700, files 0600. This is done per file rather than with a
+# umask, which would leak into the agents and make their project files private.
+
+def private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if os.stat(path).st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
+def private_open(path, mode="w"):
+    """Open for writing, creating the file 0600 (and fixing an older one)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC)
+    fd = os.open(path, flags, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, mode)
+
+
 def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    private_dir(os.path.dirname(path))
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
+    with private_open(tmp) as f:
         json.dump(data, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def secure_existing_state():
+    """Tighten folders and files left by versions before 0.2 (they were 0755/0644)."""
+    for root_dir in (STATE_DIR, CONFIG_DIR):
+        if not os.path.isdir(root_dir) or os.path.islink(root_dir):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            if os.stat(dirpath).st_mode & 0o077:
+                os.chmod(dirpath, 0o700)
+            for name in filenames:
+                fp = os.path.join(dirpath, name)
+                if not os.path.islink(fp) and os.stat(fp).st_mode & 0o077:
+                    os.chmod(fp, 0o600)
 
 
 def config():
@@ -327,8 +359,8 @@ def agent_by_id(aid):
 
 def bump_rev():
     """Touch the revision file the Omarchy panel watches for changes."""
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(REV_PATH, "w") as f:
+    private_dir(STATE_DIR)
+    with private_open(REV_PATH) as f:
         f.write(f"{time.time():.3f}\n")
 
 
@@ -347,8 +379,8 @@ def load_task(tid):
 
 def update_task(tid, **fields):
     """Read-modify-write a task under an exclusive lock; returns the new task."""
-    os.makedirs(TASKS_DIR, exist_ok=True)
-    with open(task_path(tid) + ".lock", "w") as lock:
+    private_dir(TASKS_DIR)
+    with private_open(task_path(tid) + ".lock") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         task = load_task(tid)
         if task is None:
@@ -396,15 +428,27 @@ def session(tid):
 
 # ------------------------------------------------------------------- tmux --
 
-def tmux(*args, check=False, capture=True):
+def tmux(*args, check=False, capture=True, stdin=None):
     cmd = ["tmux", "-L", SOCKET, "-f", TMUX_CONF, *args]
-    return subprocess.run(cmd, check=check, text=True,
+    return subprocess.run(cmd, check=check, text=True, input=stdin,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None)
 
 
+def paste(tid, text, enter=True):
+    """Type text into a task through a tmux paste buffer fed on stdin, so it
+    never appears in any process's arguments. Bracketed paste keeps a
+    multi-line prompt together instead of sending each line."""
+    buf = f"se-{tid}-{os.getpid()}"
+    tmux("load-buffer", "-b", buf, "-", stdin=text)
+    tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", session(tid))
+    if enter:
+        time.sleep(0.3)
+        tmux("send-keys", "-t", session(tid), "Enter")
+
+
 def write_tmux_conf():
-    os.makedirs(STATE_DIR, exist_ok=True)
+    private_dir(STATE_DIR)
     conf = """# Written by speakeasy; regenerated on every new task.
 set -g default-terminal "tmux-256color"
 set -as terminal-features ",*:RGB,*:extkeys,*:hyperlinks"
@@ -427,7 +471,7 @@ set -g status-right-length 80
 set -g window-status-format ""
 set -g window-status-current-format ""
 """
-    with open(TMUX_CONF, "w") as f:
+    with private_open(TMUX_CONF) as f:
         f.write(conf)
 
 
@@ -459,21 +503,80 @@ def reconcile(tasks):
 # ---------------------------------------------------------- notifications --
 
 def notify(task, title, body, urgency="normal"):
-    """Show a notification whose click opens the task, without blocking."""
-    if not config().get("notify", True) or not shutil.which("notify-send"):
+    """Show a notification whose click opens the task, without blocking.
+
+    The text goes to the worker on stdin: the worker lives until the
+    notification is clicked or closed, and its arguments are world-readable."""
+    if not config().get("notify", True) or not (shutil.which("gdbus") or shutil.which("notify-send")):
         return
-    subprocess.Popen([sys.executable, SELF, "_notify", task["id"], urgency, title, body],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    proc = subprocess.Popen([sys.executable, SELF, "_notify", task["id"]],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True, text=True)
+    try:
+        proc.stdin.write(json.dumps({"title": title, "body": body, "urgency": urgency}))
+        proc.stdin.close()
+    except OSError:
+        pass
+
+
+def gvariant_str(text):
+    """A GVariant string literal for gdbus (JSON escapes are valid GVariant)."""
+    return json.dumps(text, ensure_ascii=False)
+
+
+def notify_dbus(title, body, urgency):
+    """Send through D-Bus with a short-lived gdbus call; return the action
+    clicked, or "" when the notification closes. None if gdbus failed."""
+    level = {"low": 0, "normal": 1, "critical": 2}.get(urgency, 1)
+    monitor = subprocess.Popen(["gdbus", "monitor", "--session", "--dest", "org.freedesktop.Notifications",
+                                "--object-path", "/org/freedesktop/Notifications"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        time.sleep(0.2)  # let the monitor subscribe before the notification exists
+        r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                            "--object-path", "/org/freedesktop/Notifications",
+                            "--method", "org.freedesktop.Notifications.Notify",
+                            '"Speakeasy"', "uint32 0", '"utilities-terminal"',
+                            gvariant_str(title), gvariant_str(body),
+                            '["default", "Open", "open", "Open terminal"]',
+                            "{'urgency': <byte %d>}" % level, "int32 -1"],
+                           text=True, capture_output=True, timeout=10)
+        m = re.search(r"uint32 (\d+)", r.stdout)
+        if r.returncode != 0 or not m:
+            return None
+        nid = m.group(1)
+        deadline = time.time() + 6 * 3600
+        for line in monitor.stdout:
+            if f"ActionInvoked (uint32 {nid}," in line:
+                a = re.search(r"'([^']*)'\)", line)
+                return a.group(1) if a else ""
+            if f"NotificationClosed (uint32 {nid}," in line or time.time() > deadline:
+                return ""
+        return ""
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        monitor.kill()
 
 
 def cmd_notify_worker(a):
-    r = subprocess.run(["notify-send", "--app-name=Speakeasy", f"--urgency={a.urgency}",
-                        "--icon=utilities-terminal",
-                        "--action=default=Open", "--action=open=Open terminal",
-                        "--", a.title, a.body],
-                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if r.stdout.strip() in ("default", "open"):
+    try:
+        msg = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return
+    title, body, urgency = str(msg.get("title", "")), str(msg.get("body", "")), str(msg.get("urgency", "normal"))
+    action = notify_dbus(title, body, urgency) if shutil.which("gdbus") else None
+    if action is None and shutil.which("notify-send"):
+        # Fallback without gdbus: notify-send keeps the text in its arguments
+        # while it waits, so it is sent without the body.
+        r = subprocess.run(["notify-send", "--app-name=Speakeasy", f"--urgency={urgency}",
+                            "--icon=utilities-terminal", "--action=default=Open", "--", title],
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        action = r.stdout.strip()
+    if os.environ.get("SPEAKEASY_DEBUG"):
+        with private_open(os.path.join(STATE_DIR, "hooks.log"), "a") as f:
+            f.write(json.dumps({"id": a.id, "event": "notify-action", "action": action}) + "\n")
+    if action in ("default", "open"):
         task = load_task(a.id)
         if task:
             open_task(task)
@@ -492,14 +595,16 @@ def build_command(task, agent):
     if task.get("effort") and agent.get("effortArgs"):
         argv += [x.replace("{}", task["effort"]) for x in agent["effortArgs"]]
     if agent["report"] == "claude":
-        argv += [f"--name={task['title']}", "--settings", json.dumps(claude_hooks(task["id"]))]
+        argv += ["--settings", json.dumps(claude_hooks(task["id"]))]
     elif agent["report"] == "codex":
         argv += ["-c", "notify=" + json.dumps([sys.executable, SELF, "hook", task["id"], "codex"])]
     argv += extra
     prompt = task.get("prompt") or ""
     typed = ""
     if prompt:
-        mode = agent.get("prompt", "arg")
+        # Built-in agents all get the prompt typed in ("keys"): arguments of
+        # a long-running process are readable by every user on the machine.
+        mode = agent.get("prompt", "keys")
         if mode == "arg":
             argv += ["--", prompt]
         elif mode.startswith("flag:"):
@@ -552,7 +657,7 @@ def cmd_new(a):
         "detail": "", "unseen": False, "createdAt": now(), "updatedAt": now(),
         "exitCode": None, "sessionId": "",
     }
-    os.makedirs(TASKS_DIR, exist_ok=True)
+    private_dir(TASKS_DIR)
     write_json(task_path(tid), task)
     old = load_json(PREFS_PATH, {})
     recent = [cwd] + [d for d in old.get("recentCwds") or [] if d != cwd]
@@ -629,7 +734,7 @@ def cmd_run(a):
         return
     stop = threading.Event()
     if typed:
-        threading.Thread(target=type_prompt, args=(a.id, typed), daemon=True).start()
+        threading.Thread(target=type_prompt, args=(a.id, typed, agent, stop), daemon=True).start()
     threading.Thread(target=watch_quiet, args=(a.id, agent, stop), daemon=True).start()
     # Let Ctrl+C reach the agent, not this wrapper.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -644,20 +749,30 @@ def cmd_run(a):
           f"Close this window, or remove the task with `speakeasy rm {a.id}`.")
 
 
-def type_prompt(tid, text):
-    """For agents with no prompt flag: wait for the TUI to settle, then type."""
-    time.sleep(2.5)
+def type_prompt(tid, text, agent, stop):
+    """Type the first prompt once the agent is ready for it.
+
+    Ready means: the screen has settled, no question or menu is showing (a
+    trust dialog, a sign-in, a model picker: typing into one could pick an
+    answer), and for Claude Code its SessionStart hook has fired. It waits
+    as long as the agent is alive, so a trust question can take its time."""
+    started = time.time()
     last, stable = None, 0
-    for _ in range(30):
-        cur = capture(tid, 60)
+    while not stop.wait(0.5):
+        cur = capture(tid, 80)
         stable = stable + 1 if cur == last and cur.strip() else 0
         last = cur
-        if stable >= 2:
-            break
-        time.sleep(0.5)
-    tmux("send-keys", "-t", session(tid), "-l", text)
-    time.sleep(0.2)
-    tmux("send-keys", "-t", session(tid), "Enter")
+        if blocking_question(cur):
+            stable = 0
+            continue
+        if agent["report"] == "claude":
+            task = load_task(tid) or {}
+            if task.get("status") == "starting":
+                continue
+        if stable >= 3 and time.time() - started >= 2:
+            paste(tid, text)
+            update_task(tid, promptSent=True)
+            return
 
 
 def capture(tid, lines=40):
@@ -673,6 +788,13 @@ BLOCKING = [
     (("trust", "folder"), "Asks whether to trust this folder."),
     (("trust", "project"), "Asks whether to trust this folder."),
     (("trust", "workspace"), "Asks whether to trust this folder."),
+    (("do you want to proceed",), "Waiting on a question."),
+    (("enter to confirm",), "Waiting on a question."),
+    (("enter confirm",), "Waiting on a question."),
+    (("enter continue",), "Waiting on a question."),
+    (("enter to select",), "Waiting on a question."),
+    (("to navigate",), "Waiting on a question."),
+    (("then enter",), "Waiting on a question."),
 ]
 BLOCKING_MESSAGES = {msg for _, msg in BLOCKING}
 
@@ -742,7 +864,7 @@ def cmd_hook(a):
         except (ValueError, OSError):
             payload = {}
     if os.environ.get("SPEAKEASY_DEBUG"):
-        with open(os.path.join(STATE_DIR, "hooks.log"), "a") as f:
+        with private_open(os.path.join(STATE_DIR, "hooks.log"), "a") as f:
             f.write(json.dumps({"id": a.id, "event": a.event, "payload": payload}) + "\n")
     task = load_task(a.id)
     if task is None or task.get("status") in FINISHED:
@@ -1072,9 +1194,10 @@ def cmd_send(a):
     t = resolve(a.ref)
     if session(t["id"]) not in live_sessions():
         die("that task has no terminal any more")
-    tmux("send-keys", "-t", session(t["id"]), "-l", " ".join(a.text))
-    time.sleep(0.1)
-    tmux("send-keys", "-t", session(t["id"]), "Enter")
+    text = " ".join(a.text)
+    if text == "-":
+        text = sys.stdin.read().rstrip("\n")
+    paste(t["id"], text)
 
 
 def cmd_seen(a):
@@ -1248,12 +1371,10 @@ def main(argv=None):
 
     s = sub.add_parser("_notify", help=argparse.SUPPRESS)
     s.add_argument("id")
-    s.add_argument("urgency")
-    s.add_argument("title")
-    s.add_argument("body")
     s.set_defaults(fn=cmd_notify_worker)
 
     a = p.parse_args(argv)
+    secure_existing_state()
     a.fn(a)
 
 

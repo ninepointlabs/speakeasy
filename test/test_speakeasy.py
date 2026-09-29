@@ -88,13 +88,13 @@ class Pure(unittest.TestCase):
         task = make_task(model="opus")
         argv, typed = se.build_command(task, se.agent_by_id("claude"))
         self.assertEqual(argv[1], "--model=opus")
-        self.assertIn("--name=Fix login", argv)
+        self.assertFalse(any("Fix login" in a for a in argv))  # no title in argv
         hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
         self.assertIn("Stop", hooks)
         self.assertIn("PermissionRequest", hooks)
         self.assertIn(" hook abc123 Stop", hooks["Stop"][0]["hooks"][0]["command"])
-        self.assertEqual(argv[-2:], ["--", "fix it"])
-        self.assertEqual(typed, "")
+        self.assertNotIn("fix it", argv)  # the prompt is typed in, never an argument
+        self.assertEqual(typed, "fix it")
 
     def test_codex_command_sets_notify(self):
         argv, _ = se.build_command(make_task(agent="codex"), se.agent_by_id("codex"))
@@ -104,7 +104,7 @@ class Pure(unittest.TestCase):
     def test_prompt_delivery_modes(self):
         argv, _ = se.build_command(make_task(agent="antigravity", model="gemini-3.8-flash-low"), se.agent_by_id("antigravity"))
         self.assertIn("--model=gemini-3.8-flash-low", argv)
-        self.assertEqual(argv[-1], "-i=fix it")
+        self.assertNotIn("-i=fix it", argv)
         argv, typed = se.build_command(make_task(agent="crush"), se.agent_by_id("crush"))
         self.assertNotIn("fix it", argv)
         self.assertEqual(typed, "fix it")
@@ -138,12 +138,19 @@ class Pure(unittest.TestCase):
             self.assertIn(m, claude["models"])
         self.assertEqual(claude["modelLabels"]["opus"], "Opus · latest")
 
-    def test_dash_leading_text_cannot_become_an_option(self):
-        task = make_task(title="--dangerously-skip-permissions", prompt="-p rm everything")
-        argv, _ = se.build_command(task, se.agent_by_id("claude"))
-        self.assertNotIn("--dangerously-skip-permissions", argv)
-        self.assertIn("--name=--dangerously-skip-permissions", argv)
-        self.assertEqual(argv[-2:], ["--", "-p rm everything"])
+    def test_no_user_text_in_any_agent_argv(self):
+        # Process arguments are readable by every user; titles and prompts stay out.
+        builtin = {a["id"] for a in se.AGENTS}
+        for agent in [a for a in se.agents() if a["id"] in builtin]:
+            task = make_task(agent=agent["id"], title="--secret-title", prompt="-p secret prompt")
+            argv, typed = se.build_command(task, agent)
+            self.assertFalse(any("secret" in a for a in argv), (agent["id"], argv))
+            self.assertEqual(typed, "-p secret prompt")
+
+    def test_configured_arg_agents_still_keep_text_after_dashes(self):
+        agent = dict(se.agent_by_id("fake"), prompt="arg")
+        argv, _ = se.build_command(make_task(agent="fake", prompt="-x"), agent)
+        self.assertEqual(argv[-2:], ["--", "-x"])
 
     def test_model_ids_from_other_programs_are_checked(self):
         for bad in ("--yolo", "-x", "a b", "", "x;rm"):
@@ -256,10 +263,36 @@ class NewAgents(unittest.TestCase):
         models = se.fetch_models({"id": "grok-test", "path": lister, "modelsCommand": [], "modelsParse": "bullets"})
         self.assertEqual([m["id"] for m in models], ["g-2", "g-1"])
 
-    def test_hermes_runs_chat_with_query(self):
-        argv, _ = se.build_command(make_task(agent="hermes", model="x"), se.agent_by_id("hermes"))
-        self.assertEqual(argv[1], "chat")
-        self.assertEqual(argv[-1], "--query=fix it")
+    def test_hermes_runs_chat(self):
+        argv, typed = se.build_command(make_task(agent="hermes", model="x"), se.agent_by_id("hermes"))
+        self.assertEqual(argv[1:], ["chat", "--model=x"])
+        self.assertEqual(typed, "fix it")
+
+
+class Privacy(unittest.TestCase):
+    def test_state_is_private(self):
+        make_task(tid="aaa111")
+        se.update_task("aaa111", detail="x")
+        for path in (se.STATE_DIR, se.TASKS_DIR):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o700, path)
+        for path in (se.task_path("aaa111"), se.REV_PATH, se.task_path("aaa111") + ".lock"):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
+
+    def test_older_state_is_tightened(self):
+        make_task(tid="bbb222")
+        os.chmod(se.task_path("bbb222"), 0o644)
+        os.chmod(se.TASKS_DIR, 0o755)
+        se.secure_existing_state()
+        self.assertEqual(os.stat(se.task_path("bbb222")).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(se.TASKS_DIR).st_mode & 0o777, 0o700)
+
+    def test_menus_block_typing(self):
+        for screen in ("❯ 1. Yes\n  2. No\n Enter to confirm · Esc to cancel",
+                       "› 1. Review hooks\n  enter confirm · esc skip",
+                       "↑/↓ to navigate · enter to select · esc to cancel",
+                       "Do you want to proceed?"):
+            self.assertNotEqual(se.blocking_question(screen), "", screen)
+        self.assertEqual(se.blocking_question("› Ask Codex to do anything\n  ? for shortcuts"), "")
 
 
 class Dirs(unittest.TestCase):
