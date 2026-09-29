@@ -100,6 +100,9 @@ BarWidget {
                               needs: p.needsCount, done: p.doneCount, working: p.workingCount,
                               selected: p.selected, error: p.error })
     }
+    function capture(view: string, screenName: string, stateHome: string): string { return root.panel ? root.panel.capture(view === "new" ? "new" : "list", screenName, stateHome) : "no panel" }
+    function endCapture(): string { return root.panel ? root.panel.endCapture() : "no panel" }
+    function cardGeometry(): string { return root.panel ? root.panel.cardGeometry() : "{}" }
     function key(name: string): string { var p = root.openPanel(); return p ? p.ipcKey(name) : "no panel" }
     function renderTo(path: string): string { var p = root.openPanel(); return p ? p.renderTo(path) : "no panel" }
   }

@@ -24,7 +24,12 @@ Panel {
 
   readonly property string pluginDir: decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")).replace(/\/$/, "")
   readonly property string cli: pluginDir + "/bin/speakeasy"
-  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/speakeasy"
+  // Screenshot mode (IPC `capture`): a separate state directory holding demo
+  // tasks, and a window that does not take the keyboard.
+  property string demoStateHome: ""
+  property bool capturing: false
+  readonly property var procEnv: demoStateHome !== "" ? ({ XDG_STATE_HOME: demoStateHome }) : ({})
+  readonly property string stateDir: (demoStateHome || Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/speakeasy"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color accent: Color.accent
@@ -195,7 +200,7 @@ Panel {
     effort = currentEfforts.indexOf(prefs.effort || "") >= 0 ? prefs.effort : ""
     titleField.text = ""
     descArea.text = ""
-    folderField.text = prefs.cwd || ""
+    folderField.text = prefs.cwd ? folderName(prefs.cwd) : ""
     setFormFocus(3)
   }
 
@@ -239,10 +244,11 @@ Panel {
     if (title === "" && prompt === "") { error = "Give the task a title or a description."; setFormFocus(3); return }
     error = ""
     starting = true
-    var args = ["new", "--json", "-a", currentAgent.id, "-t", title, "-p", prompt]
-    if (currentModel !== "") args.push("-m", currentModel)
-    if (effort !== "") args.push("-e", effort)
-    if (folderField.text.trim() !== "") args.push("-C", folderField.text.trim())
+    // "--flag=value" so a title or description starting with "-" stays text.
+    var args = ["new", "--json", "--agent=" + currentAgent.id, "--title=" + title, "--prompt=" + prompt]
+    if (currentModel !== "") args.push("--model=" + currentModel)
+    if (effort !== "") args.push("--effort=" + effort)
+    if (folderField.text.trim() !== "") args.push("--cwd=" + folderField.text.trim())
     run(args, function(code, out, err) {
       root.starting = false
       if (code !== 0) { root.error = (err || "Could not start the task.").replace(/^speakeasy: /, ""); return }
@@ -303,6 +309,37 @@ Panel {
     return "ok"
   }
 
+  // Screenshot support: show the centered window on a named screen, reading
+  // demo state, without taking the keyboard from whoever is at it.
+  function capture(which, screenName, stateHome) {
+    if (!/^\/[^\0]*$/.test(stateHome) || stateHome.indexOf("/../") !== -1) return "bad state dir"
+    if (centered) leaveCenter()
+    demoStateHome = stateHome
+    capturing = true
+    tasks = []
+    loaded = false
+    present(which)
+    var list = Quickshell.screens
+    for (var i = 0; i < list.length; i++) if (list[i].name === screenName) targetScreen = list[i]
+    return "ok"
+  }
+
+  function endCapture() {
+    if (centered) leaveCenter()
+    capturing = false
+    demoStateHome = ""
+    refresh()
+    return "ok"
+  }
+
+  // The card's rectangle in layout coordinates of its screen (for grim).
+  function cardGeometry() {
+    if (!centered) return "{}"
+    var p = centerCard.mapToItem(null, 0, 0)
+    return JSON.stringify({ screen: targetScreen ? targetScreen.name : "", x: Math.round(p.x), y: Math.round(p.y),
+                            width: Math.round(centerCard.width), height: Math.round(centerCard.height) })
+  }
+
   function renderTo(path) {
     if (!/^\/.*\.png$/.test(path) || path.indexOf("/../") !== -1) return "bad path"
     content.grabToImage(function(result) { result.saveToFile(path) })
@@ -348,6 +385,15 @@ Panel {
   function statusLabel(s) {
     return ({ "needs-you": "needs you", "ready": "done", "running": "working", "starting": "starting",
               "exited": "ended", "stopped": "stopped" })[s] || s
+  }
+
+  // A task's model as the agent names it ("Opus · latest", "GPT-6-Sol").
+  function taskModelLabel(t) {
+    if (!t.model) return ""
+    for (var i = 0; i < agentList.length; i++)
+      if (agentList[i].id === t.agent && agentList[i].modelLabels && agentList[i].modelLabels[t.model])
+        return agentList[i].modelLabels[t.model]
+    return t.model
   }
 
   function modelLabel(m) {
@@ -432,6 +478,7 @@ Panel {
 
   Process {
     id: stateProc
+    environment: root.procEnv
     command: [root.cli, "state"]
     running: false
     stdout: StdioCollector { id: stateOut }
@@ -445,6 +492,7 @@ Panel {
 
   Process {
     id: actionProc
+    environment: root.procEnv
     property var after: null
     running: false
     stdout: StdioCollector { id: actionOut }
@@ -460,6 +508,7 @@ Panel {
 
   Process {
     id: peekProc
+    environment: root.procEnv
     running: false
     stdout: StdioCollector { id: peekOut }
     onExited: function(code) { root.peekText = code === 0 ? peekOut.text.replace(/\s+$/, "") : "" }
@@ -734,7 +783,8 @@ Panel {
                   Text {
                     width: parent.width
                     textFormat: Text.PlainText
-                    text: modelData.agentName + (modelData.model ? " · " + modelData.model : "") + "  ·  " + root.folderName(modelData.cwd) + (modelData.attached ? "  ·  on screen" : "")
+                    text: [modelData.agentName, root.taskModelLabel(modelData), modelData.effort || ""].filter(function(x) { return x !== "" }).join(" · ")
+                          + "  ·  " + root.folderName(modelData.cwd) + (modelData.attached ? "  ·  on screen" : "")
                     color: root.faint
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1115,7 +1165,7 @@ Panel {
     color: "transparent"
     WlrLayershell.namespace: "omarchy-speakeasy"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    WlrLayershell.keyboardFocus: root.capturing ? WlrKeyboardFocus.None : WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
 
     onVisibleChanged: if (visible) Qt.callLater(function() {

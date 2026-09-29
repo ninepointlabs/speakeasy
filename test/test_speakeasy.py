@@ -85,13 +85,13 @@ class Pure(unittest.TestCase):
     def test_claude_command_has_model_name_hooks_and_prompt_last(self):
         task = make_task(model="opus")
         argv, typed = se.build_command(task, se.agent_by_id("claude"))
-        self.assertEqual(argv[1:3], ["--model", "opus"])
-        self.assertEqual(argv[argv.index("--name") + 1], "Fix login")
+        self.assertEqual(argv[1], "--model=opus")
+        self.assertIn("--name=Fix login", argv)
         hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
         self.assertIn("Stop", hooks)
         self.assertIn("PermissionRequest", hooks)
         self.assertIn(" hook abc123 Stop", hooks["Stop"][0]["hooks"][0]["command"])
-        self.assertEqual(argv[-1], "fix it")
+        self.assertEqual(argv[-2:], ["--", "fix it"])
         self.assertEqual(typed, "")
 
     def test_codex_command_sets_notify(self):
@@ -101,15 +101,15 @@ class Pure(unittest.TestCase):
 
     def test_prompt_delivery_modes(self):
         argv, _ = se.build_command(make_task(agent="antigravity", model="gemini-3.8-flash-low"), se.agent_by_id("antigravity"))
-        self.assertIn("--model", argv)
-        self.assertEqual(argv[-2:], ["-i", "fix it"])
+        self.assertIn("--model=gemini-3.8-flash-low", argv)
+        self.assertEqual(argv[-1], "-i=fix it")
         argv, typed = se.build_command(make_task(agent="crush"), se.agent_by_id("crush"))
         self.assertNotIn("fix it", argv)
         self.assertEqual(typed, "fix it")
 
     def test_effort_flags(self):
         argv, _ = se.build_command(make_task(effort="high"), se.agent_by_id("claude"))
-        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertIn("--effort=high", argv)
         argv, _ = se.build_command(make_task(agent="codex", effort="xhigh"), se.agent_by_id("codex"))
         self.assertIn('model_reasoning_effort="xhigh"', argv)
         argv, _ = se.build_command(make_task(agent="antigravity", effort="high"), se.agent_by_id("antigravity"))
@@ -136,9 +136,26 @@ class Pure(unittest.TestCase):
             self.assertIn(m, claude["models"])
         self.assertEqual(claude["modelLabels"]["opus"], "Opus · latest")
 
+    def test_dash_leading_text_cannot_become_an_option(self):
+        task = make_task(title="--dangerously-skip-permissions", prompt="-p rm everything")
+        argv, _ = se.build_command(task, se.agent_by_id("claude"))
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertIn("--name=--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[-2:], ["--", "-p rm everything"])
+
+    def test_model_ids_from_other_programs_are_checked(self):
+        for bad in ("--yolo", "-x", "a b", "", "x;rm"):
+            self.assertIsNone(se.MODEL_ID.match(bad), bad)
+        for good in ("gemini-3.8-flash-low", "opus[1m]", "gpt-5.5", "provider/model:tag"):
+            self.assertIsNotNone(se.MODEL_ID.match(good), good)
+
+    def test_task_ids_are_validated_before_touching_paths(self):
+        with self.assertRaises(SystemExit):
+            se.task_path("../../etc/passwd")
+
     def test_default_model_adds_no_flag(self):
         argv, _ = se.build_command(make_task(model=""), se.agent_by_id("claude"))
-        self.assertNotIn("--model", argv)
+        self.assertFalse(any(a.startswith("--model") for a in argv))
 
 
 class Hooks(unittest.TestCase):

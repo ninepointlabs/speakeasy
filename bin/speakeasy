@@ -14,6 +14,7 @@ showing the task instead of opening a second one.
 """
 
 import argparse
+import re
 import datetime as dt
 import fcntl
 import json
@@ -87,14 +88,14 @@ CLAUDE_MODELS = [
 AGENTS = [
     {"id": "claude", "name": "Claude Code", "bin": "claude", "models": [m for m, _ in CLAUDE_MODELS],
      "modelLabels": dict(CLAUDE_MODELS), "modelFlag": "--model", "prompt": "arg", "report": "claude",
-     "efforts": ["low", "medium", "high", "xhigh", "max"], "effortArgs": ["--effort", "{}"]},
+     "efforts": ["low", "medium", "high", "xhigh", "max"], "effortArgs": ["--effort={}"]},
     {"id": "codex", "name": "Codex", "bin": "codex", "models": [""], "modelsFile": "~/.codex/models_cache.json",
-     "modelFlag": "-m", "prompt": "arg", "report": "codex",
+     "modelFlag": "--model", "prompt": "arg", "report": "codex",
      "effortArgs": ["-c", 'model_reasoning_effort="{}"']},
     {"id": "antigravity", "name": "Gemini", "bin": "agy", "models": [""], "modelsCommand": ["models"],
      "modelFlag": "--model", "prompt": "flag:-i", "report": "watch"},
     {"id": "opencode", "name": "opencode", "bin": "opencode", "models": [""],
-     "modelFlag": "-m", "prompt": "flag:--prompt", "report": "watch"},
+     "modelFlag": "--model", "prompt": "flag:--prompt", "report": "watch"},
     {"id": "cursor-agent", "name": "Cursor Agent", "bin": "cursor-agent",
      "models": ["", "composer-2.5", "composer-2.5-fast", "gpt-5.5", "sonnet-4", "opus"],
      "modelFlag": "--model", "prompt": "arg", "report": "watch"},
@@ -185,19 +186,25 @@ def read_models_file(a):
     """Codex keeps its own model list (and each model's reasoning levels)."""
     data = load_json(os.path.expanduser(a["modelsFile"]), {})
     listed = [m for m in data.get("models") or []
-              if isinstance(m, dict) and m.get("slug") and m.get("visibility", "list") == "list"]
+              if isinstance(m, dict) and MODEL_ID.match(str(m.get("slug", "")))
+              and m.get("visibility", "list") == "list"]
     if not listed:
         return
     a["models"] = [""] + [m["slug"] for m in listed]
     for m in listed:
         a["modelLabels"][m["slug"]] = m.get("display_name") or m["slug"]
-        levels = [x.get("effort") for x in m.get("supported_reasoning_levels") or [] if x.get("effort")]
+        levels = [x.get("effort") for x in m.get("supported_reasoning_levels") or []
+                  if isinstance(x, dict) and EFFORT.match(str(x.get("effort", "")))]
         if levels:
             a["modelEfforts"][m["slug"]] = levels
     # With the model left to Codex, offer only levels every model accepts.
     sets = [a["modelEfforts"][k] for k in a["modelEfforts"]]
     if sets:
         a["efforts"] = [e for e in sets[0] if all(e in x for x in sets[1:])]
+
+
+MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,99}$")
+EFFORT = re.compile(r"^[a-z]{1,20}$")
 
 
 def efforts_for(agent, model):
@@ -223,7 +230,7 @@ def fetch_models(agent):
         mid, sep, label = line.partition("\t")
         mid = mid.strip()
         # Status chatter ("Fetching available models...") has no tab.
-        if sep and mid and " " not in mid:
+        if sep and MODEL_ID.match(mid):
             models.append({"id": mid, "label": label.strip() or mid})
     if r.returncode != 0 or not models:
         return None
@@ -283,7 +290,12 @@ def bump_rev():
         f.write(f"{time.time():.3f}\n")
 
 
+TASK_ID = re.compile(r"^[0-9a-f]{6}$")
+
+
 def task_path(tid):
+    if not TASK_ID.match(str(tid)):
+        die(f"bad task id {tid!r}")
     return os.path.join(TASKS_DIR, f"{tid}.json")
 
 
@@ -417,7 +429,7 @@ def cmd_notify_worker(a):
     r = subprocess.run(["notify-send", "--app-name=Speakeasy", f"--urgency={a.urgency}",
                         "--icon=utilities-terminal",
                         "--action=default=Open", "--action=open=Open terminal",
-                        a.title, a.body],
+                        "--", a.title, a.body],
                        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if r.stdout.strip() in ("default", "open"):
         task = load_task(a.id)
@@ -431,12 +443,14 @@ def build_command(task, agent):
     """argv for the agent itself, and the prompt to type if it takes keys."""
     argv = [agent["path"] or agent["bin"]]
     extra = task.get("args") or []
+    # Values ride on their flag ("--model=x") and the prompt comes after
+    # "--", so a title, prompt or model that starts with "-" stays text.
     if task.get("model") and agent.get("modelFlag"):
-        argv += [agent["modelFlag"], task["model"]]
+        argv.append(f"{agent['modelFlag']}={task['model']}")
     if task.get("effort") and agent.get("effortArgs"):
         argv += [x.replace("{}", task["effort"]) for x in agent["effortArgs"]]
     if agent["report"] == "claude":
-        argv += ["--name", task["title"], "--settings", json.dumps(claude_hooks(task["id"]))]
+        argv += [f"--name={task['title']}", "--settings", json.dumps(claude_hooks(task["id"]))]
     elif agent["report"] == "codex":
         argv += ["-c", "notify=" + json.dumps([sys.executable, SELF, "hook", task["id"], "codex"])]
     argv += extra
@@ -445,9 +459,9 @@ def build_command(task, agent):
     if prompt:
         mode = agent.get("prompt", "arg")
         if mode == "arg":
-            argv.append(prompt)
+            argv += ["--", prompt]
         elif mode.startswith("flag:"):
-            argv += [mode[5:], prompt]
+            argv.append(f"{mode[5:]}={prompt}")
         else:
             typed = prompt
     return argv, typed
@@ -509,8 +523,8 @@ def cmd_new(a):
     if r.returncode != 0:
         update_task(tid, status="exited", detail="tmux failed: " + r.stderr.strip())
         die("tmux failed to start the task: " + r.stderr.strip())
-    tmux("set-option", "-t", session(tid), "@se_title", title)
-    tmux("set-option", "-t", session(tid), "@se_agent", label)
+    tmux("set-option", "-t", session(tid), "@se_title", title.replace("#", "##"))
+    tmux("set-option", "-t", session(tid), "@se_agent", label.replace("#", "##"))
     bump_rev()
     if a.json:
         print(json.dumps(load_task(tid)))
@@ -930,7 +944,7 @@ def cmd_rename(a):
     if not title:
         die("empty title")
     update_task(t["id"], title=title)
-    tmux("set-option", "-t", session(t["id"]), "@se_title", title)
+    tmux("set-option", "-t", session(t["id"]), "@se_title", title.replace("#", "##"))
 
 
 def stop_task(t):
