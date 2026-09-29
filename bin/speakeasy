@@ -14,6 +14,7 @@ showing the task instead of opening a second one.
 """
 
 import argparse
+import glob
 import re
 import datetime as dt
 import fcntl
@@ -101,6 +102,16 @@ AGENTS = [
      "modelFlag": "--model", "prompt": "arg", "report": "watch"},
     {"id": "crush", "name": "Crush", "bin": "crush", "models": [""],
      "modelFlag": None, "prompt": "keys", "report": "watch"},
+    {"id": "muse", "name": "Muse", "bin": "muse", "models": [""],
+     "modelsFile": "~/.local/share/muse/model-catalog/*.json", "modelsFormat": "muse",
+     "modelFlag": "--model", "prompt": "arg", "report": "watch", "effortArgs": ["--reasoning-effort={}"]},
+    {"id": "copilot", "name": "GitHub Copilot", "bin": "copilot", "models": [""],
+     "modelFlag": "--model", "prompt": "flag:--interactive", "report": "watch",
+     "efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "effortArgs": ["--reasoning-effort={}"]},
+    {"id": "grok", "name": "Grok", "bin": "grok", "models": [""], "modelsCommand": ["models"], "modelsParse": "bullets",
+     "modelFlag": "--model", "prompt": "arg", "report": "watch"},
+    {"id": "hermes", "name": "Hermes", "bin": "hermes", "baseArgs": ["chat"], "models": [""],
+     "modelFlag": "--model", "prompt": "flag:--query", "report": "watch"},
 ]
 
 DEFAULT_CONFIG = {
@@ -115,6 +126,8 @@ DEFAULT_CONFIG = {
     # Per-agent overrides and additions, e.g.
     # {"codex": {"models": ["", "gpt-5.5"]}, "mine": {"name": "Mine", "bin": "mine", ...}}
     "agents": {},
+    # Agent ids left out of the new-task picker (Settings, or `speakeasy agents --hide`).
+    "hiddenAgents": [],
 }
 
 
@@ -164,7 +177,9 @@ def agents(cfg=None):
         if aid not in seen and isinstance(a, dict) and a.get("bin"):
             a = {"id": aid, "name": aid, "models": [""], "modelFlag": None, "prompt": "keys", "report": "watch", **a}
             out.append(a)
+    hidden = set(cfg.get("hiddenAgents") or [])
     for a in out:
+        a["hidden"] = a["id"] in hidden
         a["path"] = shutil.which(a["bin"]) or ""
         a["installed"] = a["path"] != ""
         a["modelLabels"] = dict(a.get("modelLabels") or {})
@@ -182,21 +197,40 @@ def agents(cfg=None):
     return out
 
 
+def models_from_file(a):
+    """[(id, label, efforts)] from an agent's own model list on disk."""
+    out = []
+    for path in sorted(glob.glob(os.path.expanduser(a["modelsFile"]))):
+        data = load_json(path, {})
+        if a.get("modelsFormat") == "muse":
+            # Muse: rows with model_id, display_label and reasoning tiers.
+            for m in data.get("rows") or []:
+                if isinstance(m, dict) and m.get("visibility", "visible") == "visible":
+                    tiers = [x.get("tier") for x in m.get("reasoning_effort_variants") or [] if isinstance(x, dict)]
+                    out.append((str(m.get("model_id", "")), m.get("display_label"), tiers))
+        else:
+            # Codex: models with slug, display_name and supported reasoning levels.
+            for m in data.get("models") or []:
+                if isinstance(m, dict) and m.get("visibility", "list") == "list":
+                    levels = [x.get("effort") for x in m.get("supported_reasoning_levels") or [] if isinstance(x, dict)]
+                    out.append((str(m.get("slug", "")), m.get("display_name"), levels))
+    return [(mid, str(label or mid), [e for e in efforts if EFFORT.match(str(e or ""))])
+            for mid, label, efforts in out if MODEL_ID.match(mid)]
+
+
+# Order effort levels from least to most, whatever order a catalog uses.
+EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+
 def read_models_file(a):
-    """Codex keeps its own model list (and each model's reasoning levels)."""
-    data = load_json(os.path.expanduser(a["modelsFile"]), {})
-    listed = [m for m in data.get("models") or []
-              if isinstance(m, dict) and MODEL_ID.match(str(m.get("slug", "")))
-              and m.get("visibility", "list") == "list"]
+    listed = models_from_file(a)
     if not listed:
         return
-    a["models"] = [""] + [m["slug"] for m in listed]
-    for m in listed:
-        a["modelLabels"][m["slug"]] = m.get("display_name") or m["slug"]
-        levels = [x.get("effort") for x in m.get("supported_reasoning_levels") or []
-                  if isinstance(x, dict) and EFFORT.match(str(x.get("effort", "")))]
-        if levels:
-            a["modelEfforts"][m["slug"]] = levels
+    a["models"] = [""] + [mid for mid, _, _ in listed]
+    for mid, label, efforts in listed:
+        a["modelLabels"][mid] = label
+        if efforts:
+            a["modelEfforts"][mid] = sorted(efforts, key=lambda e: EFFORT_ORDER.index(e) if e in EFFORT_ORDER else 99)
     # With the model left to Codex, offer only levels every model accepts.
     sets = [a["modelEfforts"][k] for k in a["modelEfforts"]]
     if sets:
@@ -227,6 +261,14 @@ def fetch_models(agent):
         return None
     models = []
     for line in r.stdout.splitlines():
+        if agent.get("modelsParse") == "bullets":
+            # "  - grok-4.7" / "  * grok-4.6 (default)"
+            line = line.strip()
+            if line[:2] in ("- ", "* "):
+                mid = line[2:].split()[0] if line[2:].split() else ""
+                if MODEL_ID.match(mid):
+                    models.append({"id": mid, "label": mid + (" (default)" if line.startswith("*") else "")})
+            continue
         mid, sep, label = line.partition("\t")
         mid = mid.strip()
         # Status chatter ("Fetching available models...") has no tab.
@@ -441,7 +483,7 @@ def cmd_notify_worker(a):
 
 def build_command(task, agent):
     """argv for the agent itself, and the prompt to type if it takes keys."""
-    argv = [agent["path"] or agent["bin"]]
+    argv = [agent["path"] or agent["bin"]] + list(agent.get("baseArgs") or [])
     extra = task.get("args") or []
     # Values ride on their flag ("--model=x") and the prompt comes after
     # "--", so a title, prompt or model that starts with "-" stays text.
@@ -624,8 +666,10 @@ def capture(tid, lines=40):
 # screen: (all these words appear, what to tell the user).
 BLOCKING = [
     (("hooks need review",), "Codex wants you to review the hooks in ~/.codex/hooks.json (trust them once in Codex to stop this)."),
+    (("oauth/device",), "Asks you to sign in to the agent (a browser sign-in code is on its screen)."),
     (("trust", "folder"), "Asks whether to trust this folder."),
     (("trust", "project"), "Asks whether to trust this folder."),
+    (("trust", "workspace"), "Asks whether to trust this folder."),
 ]
 BLOCKING_MESSAGES = {msg for _, msg in BLOCKING}
 
@@ -898,7 +942,10 @@ def cmd_state(a):
     out = {
         "version": VERSION,
         "tmux": shutil.which("tmux") is not None,
-        "agents": [dict({k: x[k] for k in ("id", "name", "models", "modelLabels", "installed", "report", "modelEfforts")},
+        "settings": {"notify": cfg.get("notify", True) is not False,
+                     "defaultCwd": cfg.get("defaultCwd") or "~",
+                     "quietSeconds": cfg.get("quietSeconds") or 20},
+        "agents": [dict({k: x[k] for k in ("id", "name", "bin", "models", "modelLabels", "installed", "hidden", "report", "modelEfforts")},
                         efforts=x["efforts"] if x.get("effortArgs") else []) for x in items],
         "tasks": tasks,
         "prefs": {"agent": prefs.get("agent", ""), "model": prefs.get("model", ""), "effort": prefs.get("effort", ""),
@@ -907,14 +954,54 @@ def cmd_state(a):
     print(json.dumps(out))
 
 
+def update_config(**changes):
+    """Change keys in the user's config file, keeping everything else in it."""
+    user = load_json(CONFIG_PATH, {})
+    if not isinstance(user, dict):
+        die(f"{CONFIG_PATH} is not a JSON object; fix or remove it first")
+    user.update(changes)
+    write_json(CONFIG_PATH, user)
+    bump_rev()
+
+
 def cmd_agents(a):
+    if a.hide or a.show:
+        known = {x["id"] for x in agents()}
+        for aid in a.hide + a.show:
+            if aid not in known:
+                die(f"unknown agent {aid!r}; see `speakeasy agents`")
+        hidden = [x for x in config().get("hiddenAgents") or [] if x not in a.show]
+        hidden += [x for x in a.hide if x not in hidden]
+        update_config(hiddenAgents=hidden)
     items = agents()
     if a.json:
         print(json.dumps(items))
         return
     for x in items:
         models = ", ".join(m or "default" for m in x["models"])
-        print(f"{'✓' if x['installed'] else ' '} {x['id']:<13} {x['name']:<14} {models}")
+        flag = "hidden" if x["hidden"] else ("✓" if x["installed"] else "")
+        print(f"{flag:<6} {x['id']:<13} {x['name']:<15} {models}")
+
+
+SETTINGS = {
+    # name on the command line: (config key, parser)
+    "notify": ("notify", lambda v: {"on": True, "off": False, "true": True, "false": False}[v.lower()]),
+    "default-cwd": ("defaultCwd", lambda v: v),
+    "quiet-seconds": ("quietSeconds", lambda v: max(5, min(600, int(v)))),
+    "terminal": ("terminal", lambda v: v),
+}
+
+
+def cmd_set(a):
+    key, parse = SETTINGS[a.key]
+    try:
+        value = parse(a.value)
+    except (KeyError, ValueError):
+        die(f"bad value for {a.key}: {a.value!r}")
+    if a.key == "default-cwd" and not os.path.isdir(os.path.expanduser(value)):
+        die(f"folder does not exist: {value}")
+    update_config(**{key: value})
+    print(f"{a.key} = {value}")
 
 
 def cmd_peek(a):
@@ -1063,9 +1150,16 @@ def main(argv=None):
     s = sub.add_parser("clear", help="remove every finished task")
     s.set_defaults(fn=cmd_clear)
 
-    s = sub.add_parser("agents", help="show supported agents and which are installed")
+    s = sub.add_parser("agents", help="show supported agents; --hide/--show one in the new-task picker")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--hide", action="append", default=[], metavar="AGENT")
+    s.add_argument("--show", action="append", default=[], metavar="AGENT")
     s.set_defaults(fn=cmd_agents)
+
+    s = sub.add_parser("set", help="change a setting: notify on|off, default-cwd PATH, quiet-seconds N, terminal CMD")
+    s.add_argument("key", choices=sorted(SETTINGS))
+    s.add_argument("value")
+    s.set_defaults(fn=cmd_set)
 
     s = sub.add_parser("models", help="list models per agent; --refresh asks the agent again")
     s.add_argument("agent", nargs="?", default="")

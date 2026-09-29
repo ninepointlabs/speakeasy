@@ -70,6 +70,8 @@ class Pure(unittest.TestCase):
         self.assertIn("hooks", se.blocking_question("  Hooks need review\n 1 hook is new"))
         self.assertEqual(se.blocking_question("Do you trust the contents of this project?"), "Asks whether to trust this folder.")
         self.assertEqual(se.blocking_question("● OK"), "")
+        self.assertIn("sign in", se.blocking_question("Sign in at this page:\n https://auth.meta.com/oauth/device/?code=AB-CD"))
+        self.assertIn("trust", se.blocking_question("Do you trust this workspace?"))
 
     def test_codex_title_turn(self):
         self.assertTrue(se.is_codex_title_turn('{"title":"Tell a joke"}'))
@@ -207,6 +209,57 @@ class Models(unittest.TestCase):
 
     def test_cursor_has_a_fixed_list(self):
         self.assertIn("composer-2.5", se.agent_by_id("cursor-agent")["models"])
+
+
+class Settings(unittest.TestCase):
+    def setUp(self):
+        self.saved = se.load_json(se.CONFIG_PATH, {})
+
+    def tearDown(self):
+        se.write_json(se.CONFIG_PATH, self.saved)
+
+    def test_hide_and_show_keep_other_config(self):
+        se.main(["agents", "--hide=crush", "--hide=hermes"])
+        self.assertTrue(se.agent_by_id("crush")["hidden"])
+        se.main(["agents", "--show=crush"])
+        cfg = se.load_json(se.CONFIG_PATH, {})
+        self.assertEqual(cfg["hiddenAgents"], ["hermes"])
+        self.assertIn("fake", cfg["agents"])  # untouched
+
+    def test_set_values(self):
+        se.main(["set", "notify", "off"])
+        se.main(["set", "quiet-seconds", "1"])
+        se.main(["set", "default-cwd", "--", TMP])
+        cfg = se.load_json(se.CONFIG_PATH, {})
+        self.assertEqual((cfg["notify"], cfg["quietSeconds"], cfg["defaultCwd"]), (False, 5, TMP))
+        with self.assertRaises(SystemExit):
+            se.main(["set", "default-cwd", "/does/not/exist"])
+
+
+class NewAgents(unittest.TestCase):
+    def test_muse_catalog(self):
+        path = os.path.join(TMP, "muse-catalog.json")
+        se.write_json(path, {"rows": [
+            {"model_id": "muse-spark-1.3", "display_label": "Muse Spark 1.3", "visibility": "visible",
+             "reasoning_effort_variants": [{"tier": "high"}, {"tier": "low"}, {"tier": "max"}]},
+            {"model_id": "hidden-one", "visibility": "hidden"}]})
+        a = {"modelsFile": path, "modelsFormat": "muse", "modelLabels": {}, "modelEfforts": {}, "efforts": [], "effortArgs": ["x"]}
+        se.read_models_file(a)
+        self.assertEqual(a["models"], ["", "muse-spark-1.3"])
+        self.assertEqual(se.efforts_for(a, "muse-spark-1.3"), ["low", "high", "max"])
+
+    def test_grok_bullet_list(self):
+        lister = os.path.join(TMP, "fake-grok")
+        with open(lister, "w") as f:
+            f.write('#!/bin/sh\nprintf "Default model: g-2\\n\\nAvailable models:\\n  * g-2 (default)\\n  - g-1\\n"\n')
+        os.chmod(lister, 0o755)
+        models = se.fetch_models({"id": "grok-test", "path": lister, "modelsCommand": [], "modelsParse": "bullets"})
+        self.assertEqual([m["id"] for m in models], ["g-2", "g-1"])
+
+    def test_hermes_runs_chat_with_query(self):
+        argv, _ = se.build_command(make_task(agent="hermes", model="x"), se.agent_by_id("hermes"))
+        self.assertEqual(argv[1], "chat")
+        self.assertEqual(argv[-1], "--query=fix it")
 
 
 class State(unittest.TestCase):

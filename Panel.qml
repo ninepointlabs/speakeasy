@@ -80,7 +80,23 @@ Panel {
   property string effort: ""
   property int formFocus: 3
   property bool starting: false
-  readonly property var installedAgents: agentList.filter(function(a) { return a.installed })
+  readonly property var installedAgents: agentList.filter(function(a) { return a.installed && !a.hidden })
+
+  // Settings view: every known agent (installed first) with show / hide,
+  // then notifications and the default folder.
+  property var appSettings: ({})
+  property int settingsIndex: 0
+  readonly property var settingsRows: {
+    var rows = []
+    // Installed first, otherwise in Speakeasy's own order.
+    var sorted = agentList.filter(function(a) { return a.installed }).concat(agentList.filter(function(a) { return !a.installed }))
+    for (var i = 0; i < sorted.length; i++)
+      rows.push({ kind: "agent", id: sorted[i].id, name: sorted[i].name, bin: sorted[i].bin,
+                  installed: sorted[i].installed, hidden: sorted[i].hidden === true })
+    rows.push({ kind: "notify" })
+    rows.push({ kind: "cwd" })
+    return rows
+  }
   readonly property var currentAgent: agentIndex >= 0 && agentIndex < installedAgents.length ? installedAgents[agentIndex] : null
   readonly property var currentModels: currentAgent ? currentAgent.models : []
   readonly property string currentModel: currentModels[modelIndex] || ""
@@ -116,6 +132,9 @@ Panel {
     var keepId = selectedTask ? selectedTask.id : ""
     tasks = data.tasks || []
     agentList = data.agents || []
+    appSettings = data.settings || ({})
+    if (agentIndex >= installedAgents.length) agentIndex = 0
+    if (settingsIndex >= settingsRows.length) settingsIndex = Math.max(0, settingsRows.length - 1)
     prefs = data.prefs || ({})
     tmuxOk = data.tmux !== false
     loaded = true
@@ -204,6 +223,34 @@ Panel {
     setFormFocus(3)
   }
 
+  function showSettings() {
+    confirmId = ""
+    error = ""
+    peekOn = false
+    view = "settings"
+    settingsIndex = 0
+    cwdField.text = folderName(appSettings.defaultCwd ? appSettings.defaultCwd.replace(/^~/, Quickshell.env("HOME")) : "~")
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function moveSetting(delta) {
+    settingsIndex = Math.max(0, Math.min(settingsRows.length - 1, settingsIndex + delta))
+  }
+
+  function activateSetting() {
+    var row = settingsRows[settingsIndex]
+    if (!row) return
+    if (row.kind === "agent") run(["agents", (row.hidden ? "--show=" : "--hide=") + row.id])
+    else if (row.kind === "notify") run(["set", "notify", appSettings.notify === false ? "on" : "off"])
+    else if (row.kind === "cwd") { cwdField.forceActiveFocus(); cwdField.selectAll() }
+  }
+
+  function saveCwd() {
+    var v = cwdField.text.trim()
+    if (v !== "") run(["set", "default-cwd", "--", v])
+    keyCatcher.forceActiveFocus()
+  }
+
   function showList() {
     view = "list"
     error = ""
@@ -283,8 +330,15 @@ Panel {
   // Headless test hook: drive the panel by key name over IPC.
   function ipcKey(name) {
     if (!shown) return "closed"
-    if (view === "list") {
-      if (name === "down") move(1)
+    if (view === "settings") {
+      if (name === "down") moveSetting(1)
+      else if (name === "up") moveSetting(-1)
+      else if (name === "enter") activateSetting()
+      else if (name === "esc") showList()
+      else return "unknown key"
+    } else if (view === "list") {
+      if (name === "s") showSettings()
+      else if (name === "down") move(1)
       else if (name === "up") move(-1)
       else if (name === "enter") openSelected()
       else if (name === "n") showNew()
@@ -554,21 +608,29 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.view !== "list"
+      blocked: root.view === "new" || cwdField.activeFocus
       onCloseRequested: {
+        if (root.view === "settings") { root.showList(); return }
         if (root.confirmId !== "") { root.confirmId = ""; return }
         if (root.peekOn) { root.peekOn = false; return }
         root.dismiss()
       }
       onTabRequested: function(direction) { if (!root.centered) root.switchPanel(direction) }
-      onMoveRequested: function(dx, dy) { if (dy !== 0) root.move(dy) }
+      onMoveRequested: function(dx, dy) {
+        if (dy === 0) return
+        if (root.view === "settings") root.moveSetting(dy)
+        else root.move(dy)
+      }
       onActivateRequested: {
-        if (root.confirmId !== "") root.stopOrRemove()
+        if (root.view === "settings") root.activateSetting()
+        else if (root.confirmId !== "") root.stopOrRemove()
         else root.openSelected()
       }
-      onDeleteRequested: root.stopOrRemove()
+      onDeleteRequested: if (root.view === "list") root.stopOrRemove()
       onTextKey: function(t) {
+        if (root.view !== "list") return
         if (t === "n" || t === "N") root.showNew()
+        else if (t === "s" || t === "S") root.showSettings()
         else if (t === "p" || t === "P") root.togglePeek()
         else if (t === "c" || t === "C") root.clearFinished()
         else if (t === "y" && root.confirmId !== "") root.stopOrRemove()
@@ -604,7 +666,7 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.view === "new" ? "New task" : "Speakeasy"
+                text: root.view === "new" ? "New task" : (root.view === "settings" ? "Settings" : "Speakeasy")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -616,7 +678,8 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: root.view === "new" ? "Runs in a hidden terminal. You get a notification when it needs you or is done." : root.subtitle
+              text: root.view === "new" ? "Runs in a hidden terminal. You get a notification when it needs you or is done."
+                : (root.view === "settings" ? "Choose which agents appear when you start a task." : root.subtitle)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -630,6 +693,20 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(4)
 
+            Button {
+              visible: root.view === "list"
+              iconText: String.fromCodePoint(0xF0493)
+              text: "Settings"
+              tooltipText: "Agents shown, notifications, default folder (s)"
+              foreground: root.dim
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              iconSize: Style.font.body
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(3)
+              onClicked: root.showSettings()
+            }
             Button {
               visible: root.view === "list" && root.finishedCount > 0
               text: "Clear finished"
@@ -834,6 +911,99 @@ Panel {
             elide: Text.ElideRight
             verticalAlignment: Text.AlignBottom
           }
+        }
+
+        // ------------------------------------------------------ settings --
+        Column {
+          visible: root.view === "settings"
+          width: parent.width
+          spacing: Style.space(4)
+
+          Repeater {
+            model: root.settingsRows
+
+            Rectangle {
+              id: setRow
+              required property var modelData
+              required property int index
+              readonly property bool isSelected: index === root.settingsIndex
+              readonly property bool firstOfKind: index === 0 || root.settingsRows[index - 1].kind !== modelData.kind
+              width: parent.width
+              radius: Style.cornerRadius
+              color: isSelected || setMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : "transparent"
+              border.width: isSelected ? Math.max(1, Style.space(2)) : 0
+              border.color: root.accent
+              implicitHeight: Math.max(setName.implicitHeight + setNote.implicitHeight, setState.implicitHeight) + Style.space(12)
+
+              MouseArea {
+                id: setMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: { root.settingsIndex = setRow.index; root.activateSetting() }
+              }
+
+              Column {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(260)
+
+                Text {
+                  id: setName
+                  textFormat: Text.PlainText
+                  text: setRow.modelData.kind === "agent" ? setRow.modelData.name
+                      : (setRow.modelData.kind === "notify" ? "Notifications" : "Default folder")
+                  color: setRow.modelData.kind === "agent" && !setRow.modelData.installed ? root.dim : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: setRow.isSelected
+                }
+                Text {
+                  id: setNote
+                  textFormat: Text.PlainText
+                  text: setRow.modelData.kind === "agent"
+                      ? setRow.modelData.bin + (setRow.modelData.installed ? "  ·  installed" : "  ·  not installed")
+                      : (setRow.modelData.kind === "notify" ? "When a task needs you or finishes" : "Where new tasks start when you leave Folder as it is")
+                  color: root.faint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Text {
+                id: setState
+                visible: setRow.modelData.kind !== "cwd"
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: setRow.modelData.kind === "agent" ? (setRow.modelData.hidden ? "Hidden" : "Shown")
+                    : (root.appSettings.notify === false ? "Off" : "On")
+                color: (setRow.modelData.kind === "agent" ? !setRow.modelData.hidden : root.appSettings.notify !== false) ? root.accent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+            }
+          }
+        }
+
+        // The default-folder editor sits outside the Repeater so its id is
+        // reachable; it lines up with the last settings row.
+        TextField {
+          id: cwdField
+          visible: root.view === "settings"
+          width: parent.width
+          placeholderText: "~/Projects"
+          foreground: root.foreground
+          accent: root.accent
+          font.family: root.fontFamily
+          hasCursor: root.view === "settings" && root.settingsRows[root.settingsIndex] && root.settingsRows[root.settingsIndex].kind === "cwd"
+          Keys.onReturnPressed: root.saveCwd()
+          Keys.onEnterPressed: root.saveCwd()
+          Keys.onEscapePressed: { root.showSettings(); root.settingsIndex = root.settingsRows.length - 1 }
+          Keys.onTabPressed: root.saveCwd()
         }
 
         // ---------------------------------------------------------- form --
@@ -1144,8 +1314,10 @@ Panel {
           textFormat: Text.PlainText
           text: root.view === "new"
             ? "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back"
-            : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear finished  ·  Esc close"
-                                     : "n new  ·  Esc close")
+            : root.view === "settings"
+              ? "↑↓ pick  ·  Enter or Space toggle / edit  ·  Enter saves the folder  ·  Esc back"
+              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear finished  ·  s settings  ·  Esc close"
+                                       : "n new  ·  s settings  ·  Esc close")
           color: root.faint
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
