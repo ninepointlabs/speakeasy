@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ninepointlabs.speakeasy",
   "name": "Speakeasy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Ninepoint Labs",
   "license": "MIT",
   "description": "Run Claude Code, Codex and other AI agents in hidden terminals, one named tab per task. The bar shows what is running and what needs you; a notification or a keystroke opens the terminal only when you want to see it.",
