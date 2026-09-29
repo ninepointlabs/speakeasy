@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""Speakeasy: run AI coding agents in hidden terminals, one named tab per task.
+
+Every task is a tmux session on a private socket (`tmux -L speakeasy`), so the
+agent keeps working with no window on screen. Claude Code reports its state
+through hooks and Codex through its `notify` program; other agents are
+watched for output going quiet. When a task needs you, or finishes a turn, a
+desktop notification appears, and clicking it opens that task's terminal.
+Closing the terminal only detaches: the task carries on out of sight.
+
+Only the Python standard library and tmux are required. notify-send enables
+notifications; hyprctl (Hyprland) lets `open` focus a window that is already
+showing the task instead of opening a second one.
+"""
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "0.1.0"
+SOCKET = "speakeasy"
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "speakeasy")
+TASKS_DIR = os.path.join(STATE_DIR, "tasks")
+REV_PATH = os.path.join(STATE_DIR, "rev")
+PREFS_PATH = os.path.join(STATE_DIR, "prefs.json")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "speakeasy")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+TMUX_CONF = os.path.join(STATE_DIR, "tmux.conf")
+SELF = os.path.realpath(__file__)
+
+# Status values, in the order the panel sorts them.
+#   needs-you  the agent is blocked on you: an approval or a question
+#   ready      the agent finished a turn; results are waiting to be read
+#   running    working
+#   starting   tmux session created, agent not reporting yet
+#   exited     the agent process ended on its own
+#   stopped    you stopped it
+LIVE = ("starting", "running", "needs-you", "ready")
+FINISHED = ("exited", "stopped")
+
+# Known agents. `models` are offered in the picker; "" means "the agent's own
+# default". `prompt` says how the first prompt is delivered: as an argument
+# (`arg`), behind a flag (`flag:<name>`), or typed into the TUI (`keys`).
+# `report` is how Speakeasy learns the agent's state: `claude` hooks, the
+# `codex` notify program, or `watch` (output going quiet).
+AGENTS = [
+    {"id": "claude", "name": "Claude Code", "bin": "claude", "models": ["", "fable", "opus", "sonnet", "haiku"],
+     "modelFlag": "--model", "prompt": "arg", "report": "claude"},
+    {"id": "codex", "name": "Codex", "bin": "codex", "models": [""],
+     "modelFlag": "-m", "prompt": "arg", "report": "codex"},
+    {"id": "gemini", "name": "Gemini CLI", "bin": "gemini", "models": [""],
+     "modelFlag": "-m", "prompt": "flag:-i", "report": "watch"},
+    {"id": "opencode", "name": "opencode", "bin": "opencode", "models": [""],
+     "modelFlag": "-m", "prompt": "flag:--prompt", "report": "watch"},
+    {"id": "cursor-agent", "name": "Cursor Agent", "bin": "cursor-agent", "models": [""],
+     "modelFlag": "--model", "prompt": "arg", "report": "watch"},
+    {"id": "crush", "name": "Crush", "bin": "crush", "models": [""],
+     "modelFlag": None, "prompt": "keys", "report": "watch"},
+]
+
+DEFAULT_CONFIG = {
+    # Command prefix used to open a task's terminal; the attach command is
+    # appended. Empty = xdg-terminal-exec, then common terminals.
+    "terminal": "",
+    # Folder new tasks start in when none is given.
+    "defaultCwd": "~",
+    # Seconds of unchanged output before a watched agent counts as waiting.
+    "quietSeconds": 20,
+    "notify": True,
+    # Per-agent overrides and additions, e.g.
+    # {"codex": {"models": ["", "gpt-5.5"]}, "mine": {"name": "Mine", "bin": "mine", ...}}
+    "agents": {},
+}
+
+
+# ---------------------------------------------------------------- helpers --
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def load_json(path, fallback):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def config():
+    cfg = dict(DEFAULT_CONFIG)
+    user = load_json(CONFIG_PATH, {})
+    if isinstance(user, dict):
+        cfg.update(user)
+    return cfg
+
+
+def agents(cfg=None):
+    """Known agents merged with config overrides, each marked installed or not."""
+    cfg = cfg or config()
+    extra = cfg.get("agents") or {}
+    out = []
+    seen = set()
+    for base in AGENTS:
+        a = dict(base)
+        a.update(extra.get(a["id"]) or {})
+        out.append(a)
+        seen.add(a["id"])
+    for aid, a in extra.items():
+        if aid not in seen and isinstance(a, dict) and a.get("bin"):
+            a = {"id": aid, "name": aid, "models": [""], "modelFlag": None, "prompt": "keys", "report": "watch", **a}
+            out.append(a)
+    for a in out:
+        a["path"] = shutil.which(a["bin"]) or ""
+        a["installed"] = a["path"] != ""
+    return out
+
+
+def agent_by_id(aid):
+    for a in agents():
+        if a["id"] == aid:
+            return a
+    return None
+
+
+def bump_rev():
+    """Touch the revision file the Omarchy panel watches for changes."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(REV_PATH, "w") as f:
+        f.write(f"{time.time():.3f}\n")
+
+
+def task_path(tid):
+    return os.path.join(TASKS_DIR, f"{tid}.json")
+
+
+def load_task(tid):
+    return load_json(task_path(tid), None)
+
+
+def update_task(tid, **fields):
+    """Read-modify-write a task under an exclusive lock; returns the new task."""
+    os.makedirs(TASKS_DIR, exist_ok=True)
+    with open(task_path(tid) + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        task = load_task(tid)
+        if task is None:
+            return None
+        task.update(fields)
+        task["updatedAt"] = now()
+        write_json(task_path(tid), task)
+    bump_rev()
+    return task
+
+
+def all_tasks():
+    try:
+        names = os.listdir(TASKS_DIR)
+    except OSError:
+        return []
+    tasks = [load_json(os.path.join(TASKS_DIR, n), None) for n in names if n.endswith(".json")]
+    return [t for t in tasks if isinstance(t, dict)]
+
+
+def resolve(ref):
+    """Find a task by id, id prefix, or (case-insensitive) title."""
+    tasks = all_tasks()
+    for t in tasks:
+        if t["id"] == ref:
+            return t
+    hits = [t for t in tasks if t["id"].startswith(ref)] or \
+           [t for t in tasks if t["title"].lower() == ref.lower()] or \
+           [t for t in tasks if ref.lower() in t["title"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"no task matches {ref!r}")
+    die(f"{ref!r} matches several tasks: " + ", ".join(f"{t['id']} ({t['title']})" for t in hits))
+
+
+def die(msg, code=1):
+    print(f"speakeasy: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def session(tid):
+    return f"se-{tid}"
+
+
+# ------------------------------------------------------------------- tmux --
+
+def tmux(*args, check=False, capture=True):
+    cmd = ["tmux", "-L", SOCKET, "-f", TMUX_CONF, *args]
+    return subprocess.run(cmd, check=check, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+
+
+def write_tmux_conf():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    conf = """# Written by speakeasy; regenerated on every new task.
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",*:RGB,*:extkeys,*:hyperlinks"
+set -g extended-keys on
+set -g allow-passthrough on
+set -g escape-time 10
+set -g history-limit 50000
+set -g mouse on
+set -g remain-on-exit on
+set -g destroy-unattached off
+set -g detach-on-destroy on
+set -g set-titles on
+set -g set-titles-string "#{@se_title} · speakeasy #{session_name}"
+set -g status-position bottom
+set -g status-style "fg=default,bg=default"
+set -g status-left " #[bold]#{@se_title}#[nobold]  #[dim]#{@se_agent}"
+set -g status-left-length 120
+set -g status-right "#[dim]close the window to hide it · the task keeps running "
+set -g status-right-length 80
+set -g window-status-format ""
+set -g window-status-current-format ""
+"""
+    with open(TMUX_CONF, "w") as f:
+        f.write(conf)
+
+
+def live_sessions():
+    r = tmux("list-sessions", "-F", "#{session_name} #{session_attached}")
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        name, _, attached = line.partition(" ")
+        out[name] = attached not in ("", "0")
+    return out
+
+
+def reconcile(tasks):
+    """Mark tasks whose tmux session vanished (reboot, tmux killed) as exited."""
+    sessions = live_sessions()
+    for t in tasks:
+        t["alive"] = session(t["id"]) in sessions
+        t["attached"] = sessions.get(session(t["id"]), False)
+        if t.get("status") in LIVE and session(t["id"]) not in sessions:
+            nt = update_task(t["id"], status="exited", detail="The terminal session is gone.")
+            if nt:
+                t.update(nt)
+                t["alive"] = t["attached"] = False
+    return tasks
+
+
+# ---------------------------------------------------------- notifications --
+
+def notify(task, title, body, urgency="normal"):
+    """Show a notification whose click opens the task, without blocking."""
+    if not config().get("notify", True) or not shutil.which("notify-send"):
+        return
+    subprocess.Popen([sys.executable, SELF, "_notify", task["id"], urgency, title, body],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def cmd_notify_worker(a):
+    r = subprocess.run(["notify-send", "--app-name=Speakeasy", f"--urgency={a.urgency}",
+                        "--icon=utilities-terminal",
+                        "--action=default=Open", "--action=open=Open terminal",
+                        a.title, a.body],
+                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.stdout.strip() in ("default", "open"):
+        task = load_task(a.id)
+        if task:
+            open_task(task)
+
+
+# ------------------------------------------------------------ launching --
+
+def build_command(task, agent):
+    """argv for the agent itself, and the prompt to type if it takes keys."""
+    argv = [agent["path"] or agent["bin"]]
+    extra = task.get("args") or []
+    if task.get("model") and agent.get("modelFlag"):
+        argv += [agent["modelFlag"], task["model"]]
+    if agent["report"] == "claude":
+        argv += ["--name", task["title"], "--settings", json.dumps(claude_hooks(task["id"]))]
+    elif agent["report"] == "codex":
+        argv += ["-c", "notify=" + json.dumps([sys.executable, SELF, "hook", task["id"], "codex"])]
+    argv += extra
+    prompt = task.get("prompt") or ""
+    typed = ""
+    if prompt:
+        mode = agent.get("prompt", "arg")
+        if mode == "arg":
+            argv.append(prompt)
+        elif mode.startswith("flag:"):
+            argv += [mode[5:], prompt]
+        else:
+            typed = prompt
+    return argv, typed
+
+
+def claude_hooks(tid):
+    def hook(event):
+        return [{"hooks": [{"type": "command",
+                            "command": " ".join(shlex.quote(x) for x in [sys.executable, SELF, "hook", tid, event])}]}]
+    return {"hooks": {name: hook(name) for name in
+                      ("SessionStart", "UserPromptSubmit", "PostToolUse", "PermissionRequest", "Notification", "Stop")}}
+
+
+def cmd_new(a):
+    cfg = config()
+    if a.interactive:
+        interactive_new(a, cfg)
+    if not a.title and not a.prompt:
+        die("give the task a --title or a --prompt (or use -i)")
+    agent = agent_by_id(a.agent or "")
+    if agent is None:
+        die(f"unknown agent {a.agent!r}; see `speakeasy agents`")
+    if not agent["installed"]:
+        die(f"{agent['name']} ({agent['bin']}) is not installed")
+    if not shutil.which("tmux"):
+        die("tmux is required")
+    cwd = os.path.abspath(os.path.expanduser(a.cwd or cfg.get("defaultCwd") or "~"))
+    if not os.path.isdir(cwd):
+        die(f"folder does not exist: {cwd}")
+    prompt = a.prompt
+    if prompt == "-":
+        prompt = sys.stdin.read()
+    prompt = (prompt or "").strip()
+    title = (a.title or prompt.splitlines()[0][:60]).strip()
+
+    tid = secrets.token_hex(3)
+    while os.path.exists(task_path(tid)):
+        tid = secrets.token_hex(3)
+    task = {
+        "id": tid, "title": title, "prompt": prompt, "agent": agent["id"], "agentName": agent["name"],
+        "model": a.model or "", "cwd": cwd, "args": a.extra or [], "status": "starting",
+        "detail": "", "unseen": False, "createdAt": now(), "updatedAt": now(),
+        "exitCode": None, "sessionId": "",
+    }
+    os.makedirs(TASKS_DIR, exist_ok=True)
+    write_json(task_path(tid), task)
+    write_json(PREFS_PATH, {"agent": agent["id"], "model": task["model"], "cwd": cwd})
+
+    write_tmux_conf()
+    label = agent["name"] + (f" · {task['model']}" if task["model"] else "")
+    r = tmux("new-session", "-d", "-s", session(tid), "-c", cwd, "-x", "200", "-y", "50",
+             "-e", f"SPEAKEASY_TASK={tid}",
+             shlex.join([sys.executable, SELF, "_run", tid]))
+    if r.returncode != 0:
+        update_task(tid, status="exited", detail="tmux failed: " + r.stderr.strip())
+        die("tmux failed to start the task: " + r.stderr.strip())
+    tmux("set-option", "-t", session(tid), "@se_title", title)
+    tmux("set-option", "-t", session(tid), "@se_agent", label)
+    bump_rev()
+    if a.json:
+        print(json.dumps(load_task(tid)))
+    else:
+        print(f"{tid}  {title}  ({label}, {cwd})")
+    if a.open:
+        open_task(load_task(tid))
+
+
+def interactive_new(a, cfg):
+    """Plain prompts for desktops without the Omarchy panel."""
+    installed = [x for x in agents(cfg) if x["installed"]]
+    if not installed:
+        die("no supported agent is installed")
+    prefs = load_json(PREFS_PATH, {})
+    for i, x in enumerate(installed, 1):
+        print(f"  {i}. {x['name']}")
+    default = next((i for i, x in enumerate(installed, 1) if x["id"] == prefs.get("agent")), 1)
+    pick = input(f"Agent [{default}]: ").strip() or str(default)
+    agent = installed[int(pick) - 1]
+    models = agent["models"]
+    if len(models) > 1:
+        for i, m in enumerate(models, 1):
+            print(f"  {i}. {m or 'default'}")
+        pick = input("Model [1]: ").strip() or "1"
+        a.model = models[int(pick) - 1]
+    a.agent = agent["id"]
+    a.title = input("Title: ").strip()
+    print("Describe the task (finish with an empty line):")
+    lines = []
+    while True:
+        line = input()
+        if line == "":
+            break
+        lines.append(line)
+    a.prompt = "\n".join(lines)
+    a.cwd = input(f"Folder [{prefs.get('cwd') or cfg.get('defaultCwd')}]: ").strip() or prefs.get("cwd") or a.cwd
+
+
+def cmd_run(a):
+    """Runs inside the tmux pane: start the agent, watch it, record its exit."""
+    task = load_task(a.id)
+    if task is None:
+        die("task vanished")
+    agent = agent_by_id(task["agent"])
+    argv, typed = build_command(task, agent)
+    update_task(a.id, status="running" if agent["report"] != "claude" else "starting")
+    try:
+        proc = subprocess.Popen(argv, cwd=task["cwd"])
+    except OSError as e:
+        update_task(a.id, status="exited", detail=str(e), exitCode=127)
+        print(f"speakeasy: could not start {argv[0]}: {e}")
+        return
+    stop = threading.Event()
+    if typed:
+        threading.Thread(target=type_prompt, args=(a.id, typed), daemon=True).start()
+    threading.Thread(target=watch_quiet, args=(a.id, agent, stop), daemon=True).start()
+    # Let Ctrl+C reach the agent, not this wrapper.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    code = proc.wait()
+    stop.set()
+    task = load_task(a.id) or task
+    if task.get("status") != "stopped":
+        task = update_task(a.id, status="exited", exitCode=code, unseen=True,
+                           detail="Finished." if code == 0 else f"Exited with status {code}.")
+        notify(task, f"{task['title']} ended", task["detail"] + " Click to see the output.")
+    print(f"\n[speakeasy] {agent['name']} exited with status {code}. "
+          f"Close this window, or remove the task with `speakeasy rm {a.id}`.")
+
+
+def type_prompt(tid, text):
+    """For agents with no prompt flag: wait for the TUI to settle, then type."""
+    time.sleep(2.5)
+    last, stable = None, 0
+    for _ in range(30):
+        cur = capture(tid, 60)
+        stable = stable + 1 if cur == last and cur.strip() else 0
+        last = cur
+        if stable >= 2:
+            break
+        time.sleep(0.5)
+    tmux("send-keys", "-t", session(tid), "-l", text)
+    time.sleep(0.2)
+    tmux("send-keys", "-t", session(tid), "Enter")
+
+
+def capture(tid, lines=40):
+    r = tmux("capture-pane", "-p", "-J", "-t", session(tid), "-S", f"-{lines}")
+    return r.stdout if r.returncode == 0 else ""
+
+
+def watch_quiet(tid, agent, stop):
+    """Call the agent 'ready' once its screen stops changing.
+
+    Agents that report through hooks (Claude) are only watched while still
+    'starting': a first-run question such as Claude's folder-trust dialog
+    comes before any hook fires, and would otherwise sit unnoticed.
+    """
+    hooked = agent["report"] == "claude"
+    quiet = float(config().get("quietSeconds") or 20)
+    last, changed_at, announced = None, time.time(), False
+    while not stop.wait(2.0):
+        cur = capture(tid, 80)
+        t = time.time()
+        if cur != last:
+            last, changed_at = cur, t
+            task = load_task(tid)
+            if task and announced and (task.get("status") == "ready" and not hooked
+                                       or task.get("status") == "needs-you" and task.get("detail", "").startswith("Asks whether to trust")):
+                update_task(tid, status="running", detail="")
+            announced = False
+            continue
+        if announced or t - changed_at < min(quiet, 8 if hooked else quiet):
+            continue
+        announced = True
+        task = load_task(tid)
+        if not task:
+            continue
+        trust = "trust" in cur.lower() and "folder" in cur.lower() and task.get("status") in ("starting", "running")
+        if trust or (hooked and task.get("status") == "starting"):
+            msg = "Asks whether to trust this folder." if trust else "Waiting on a question before it starts."
+            task = update_task(tid, status="needs-you", unseen=True, detail=msg)
+            notify(task, f"{task['title']} needs you", msg, urgency="critical")
+        elif hooked:
+            continue
+        elif task.get("status") in ("running", "starting"):
+            task = update_task(tid, status="ready", unseen=True,
+                               detail="Quiet for a while: probably finished or waiting for you.")
+            notify(task, f"{task['title']} is waiting", "The output stopped changing. Click to look.")
+
+
+# ------------------------------------------------------------------ hooks --
+
+def cmd_hook(a):
+    """Called by the agent (Claude hooks, Codex notify) to report its state."""
+    payload = {}
+    if a.event == "codex":
+        try:
+            payload = json.loads(a.payload[-1]) if a.payload else {}
+        except ValueError:
+            payload = {}
+    else:
+        try:
+            raw = sys.stdin.read()
+            payload = json.loads(raw) if raw.strip() else {}
+        except (ValueError, OSError):
+            payload = {}
+    if os.environ.get("SPEAKEASY_DEBUG"):
+        with open(os.path.join(STATE_DIR, "hooks.log"), "a") as f:
+            f.write(json.dumps({"id": a.id, "event": a.event, "payload": payload}) + "\n")
+    task = load_task(a.id)
+    if task is None or task.get("status") in FINISHED:
+        return
+    ev = a.event
+    if ev == "SessionStart":
+        update_task(a.id, status="running", sessionId=payload.get("session_id", task.get("sessionId", "")))
+    elif ev in ("UserPromptSubmit", "PostToolUse"):
+        if task.get("status") != "running":
+            update_task(a.id, status="running", detail="", unseen=False, pendingAsk="")
+    elif ev == "PermissionRequest":
+        # Arrives just before the permission Notification; remember what is
+        # being asked so the alert can say it.
+        update_task(a.id, pendingAsk=describe_tool(payload.get("tool_name", ""), payload.get("tool_input") or {}))
+    elif ev == "Notification":
+        kind = payload.get("notification_type", "")
+        msg = payload.get("message") or "Claude needs your attention."
+        if kind == "permission_prompt" and task.get("pendingAsk"):
+            msg = "Wants to " + task["pendingAsk"]
+        if kind == "idle_prompt" and task.get("status") == "ready":
+            return  # already announced by Stop
+        if kind in ("auth_success",):
+            return
+        task = update_task(a.id, status="needs-you", detail=msg, unseen=True)
+        notify(task, f"{task['title']} needs you", msg, urgency="critical")
+    elif ev == "Stop":
+        summary = first_line(payload.get("last_assistant_message") or "") or \
+            last_assistant_line(payload.get("transcript_path"))
+        task = update_task(a.id, status="ready", detail=summary or "Finished its turn.", unseen=True)
+        notify(task, f"{task['title']} is done", summary or "Results are ready. Click to open.")
+    elif ev == "codex":
+        if payload.get("type") == "agent-turn-complete":
+            msg = (payload.get("last-assistant-message") or "").strip()
+            if is_codex_title_turn(msg):
+                return
+            task = update_task(a.id, status="ready", detail=first_line(msg) or "Finished its turn.", unseen=True)
+            notify(task, f"{task['title']} is done", first_line(msg, 200) or "Results are ready. Click to open.")
+
+
+def is_codex_title_turn(msg):
+    """Codex runs a side turn to name the thread; its reply is {"title": ...}."""
+    try:
+        data = json.loads(msg)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and set(data) == {"title"}
+
+
+def describe_tool(name, inp):
+    """'run: npm test' / 'edit src/app.py' — what a permission prompt is about."""
+    if name == "Bash":
+        return "run: " + first_line(inp.get("command", ""), 100)
+    if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        path = inp.get("file_path") or inp.get("notebook_path") or ""
+        return ("write " if name == "Write" else "edit ") + os.path.basename(path)
+    if name == "WebFetch":
+        return "fetch " + inp.get("url", "")
+    if name == "WebSearch":
+        return "search the web: " + inp.get("query", "")
+    return f"use {name}" if name else "do something"
+
+
+def first_line(text, limit=140):
+    for line in (text or "").splitlines():
+        line = line.strip().lstrip("#*- ").strip()
+        if line:
+            return line if len(line) <= limit else line[: limit - 1] + "…"
+    return ""
+
+
+def last_assistant_line(path):
+    """First line of Claude's last text reply, read from the session transcript."""
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 400_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        msg = entry.get("message") or {}
+        if entry.get("type") != "assistant" or msg.get("role") != "assistant":
+            continue
+        for block in msg.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                return first_line(block["text"])
+    return ""
+
+
+# ------------------------------------------------------------------- open --
+
+def terminal_prefix(cfg):
+    custom = (cfg.get("terminal") or os.environ.get("SPEAKEASY_TERMINAL") or "").strip()
+    if custom:
+        return shlex.split(custom)
+    for name, prefix in (("xdg-terminal-exec", ["xdg-terminal-exec"]),
+                         ("ghostty", ["ghostty", "-e"]), ("foot", ["foot"]), ("kitty", ["kitty"]),
+                         ("alacritty", ["alacritty", "-e"]), ("wezterm", ["wezterm", "start", "--"]),
+                         ("konsole", ["konsole", "-e"]), ("gnome-terminal", ["gnome-terminal", "--"]),
+                         ("xterm", ["xterm", "-e"])):
+        if shutil.which(name):
+            return prefix
+    return []
+
+
+def focus_existing(tid):
+    """On Hyprland, focus a window already attached to this task."""
+    if not shutil.which("hyprctl"):
+        return False
+    r = subprocess.run(["hyprctl", "-j", "clients"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        clients = json.loads(r.stdout or "[]")
+    except ValueError:
+        return False
+    marker = f"speakeasy {session(tid)}"
+    for c in clients:
+        if marker in (c.get("title") or ""):
+            addr = c["address"]
+            # Hyprland 0.55+ with a Lua config takes Lua dispatchers; older
+            # (hyprlang) configs take the classic `focuswindow` form.
+            r = subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{addr}" }})'],
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if r.returncode != 0 or "error" in r.stdout.lower():
+                subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    return False
+
+
+def open_task(task):
+    tid = task["id"]
+    if task.get("unseen"):
+        task = update_task(tid, unseen=False) or task
+    if session(tid) not in live_sessions():
+        die(f"task {tid} has no terminal any more")
+    if focus_existing(tid):
+        return
+    prefix = terminal_prefix(config())
+    if not prefix:
+        die("no terminal emulator found; set \"terminal\" in " + CONFIG_PATH)
+    attach = ["tmux", "-L", SOCKET, "-f", TMUX_CONF, "attach-session", "-t", session(tid)]
+    subprocess.Popen(prefix + attach, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True, cwd=task.get("cwd") or HOME)
+
+
+def cmd_open(a):
+    if a.ref == "next":
+        tasks = sorted(reconcile(all_tasks()), key=sort_key)
+        pick = next((t for t in tasks if t["status"] == "needs-you" or t.get("unseen")), None)
+        if pick is None:
+            die("nothing is waiting for you")
+        open_task(pick)
+        return
+    open_task(resolve(a.ref))
+
+
+# ------------------------------------------------------------ list & co. --
+
+ORDER = {"needs-you": 0, "ready": 1, "running": 2, "starting": 3, "exited": 4, "stopped": 5}
+
+
+def sort_key(t):
+    # Attention first; inside a group, newest activity first.
+    return (ORDER.get(t.get("status"), 9), -(dt.datetime.fromisoformat(t["updatedAt"]).timestamp()))
+
+
+def cmd_list(a):
+    tasks = sorted(reconcile(all_tasks()), key=sort_key)
+    if a.json:
+        print(json.dumps(tasks))
+        return
+    if not tasks:
+        print("No tasks. Start one with `speakeasy new`.")
+        return
+    for t in tasks:
+        model = f"·{t['model']}" if t.get("model") else ""
+        flag = "*" if t.get("unseen") else " "
+        print(f"{t['id']} {flag}{t['status']:<9} {t['title'][:48]:<48} {t['agent']}{model}")
+
+
+def cmd_state(a):
+    """Everything the panel needs in one call."""
+    if not os.path.exists(REV_PATH):
+        bump_rev()
+    cfg = config()
+    tasks = sorted(reconcile(all_tasks()), key=sort_key)
+    prefs = load_json(PREFS_PATH, {})
+    out = {
+        "version": VERSION,
+        "tmux": shutil.which("tmux") is not None,
+        "agents": [{k: x[k] for k in ("id", "name", "models", "installed", "report")} for x in agents(cfg)],
+        "tasks": tasks,
+        "prefs": {"agent": prefs.get("agent", ""), "model": prefs.get("model", ""),
+                  "cwd": prefs.get("cwd") or os.path.expanduser(cfg.get("defaultCwd") or "~")},
+    }
+    print(json.dumps(out))
+
+
+def cmd_agents(a):
+    items = agents()
+    if a.json:
+        print(json.dumps(items))
+        return
+    for x in items:
+        models = ", ".join(m or "default" for m in x["models"])
+        print(f"{'✓' if x['installed'] else ' '} {x['id']:<13} {x['name']:<14} {models}")
+
+
+def cmd_peek(a):
+    t = resolve(a.ref)
+    # Agent TUIs pad the screen with blank rows; show the last lines with ink.
+    lines = [ln.rstrip() for ln in capture(t["id"], max(200, a.lines * 4)).splitlines()]
+    print("\n".join([ln for ln in lines if ln.strip()][-a.lines:]))
+
+
+def cmd_send(a):
+    t = resolve(a.ref)
+    if session(t["id"]) not in live_sessions():
+        die("that task has no terminal any more")
+    tmux("send-keys", "-t", session(t["id"]), "-l", " ".join(a.text))
+    time.sleep(0.1)
+    tmux("send-keys", "-t", session(t["id"]), "Enter")
+
+
+def cmd_seen(a):
+    t = resolve(a.ref)
+    update_task(t["id"], unseen=False)
+
+
+def cmd_rename(a):
+    t = resolve(a.ref)
+    title = " ".join(a.title).strip()
+    if not title:
+        die("empty title")
+    update_task(t["id"], title=title)
+    tmux("set-option", "-t", session(t["id"]), "@se_title", title)
+
+
+def stop_task(t):
+    if t.get("status") in LIVE:
+        update_task(t["id"], status="stopped", detail="Stopped.", unseen=False)
+    tmux("kill-session", "-t", session(t["id"]))
+
+
+def cmd_stop(a):
+    stop_task(resolve(a.ref))
+
+
+def cmd_rm(a):
+    t = resolve(a.ref)
+    stop_task(t)
+    for p in (task_path(t["id"]), task_path(t["id"]) + ".lock"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    bump_rev()
+
+
+def cmd_clear(a):
+    """Remove every finished task (exited or stopped)."""
+    n = 0
+    for t in reconcile(all_tasks()):
+        if t.get("status") in FINISHED:
+            tmux("kill-session", "-t", session(t["id"]))
+            for p in (task_path(t["id"]), task_path(t["id"]) + ".lock"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            n += 1
+    bump_rev()
+    print(f"Removed {n} finished task{'s' if n != 1 else ''}.")
+
+
+PLUGIN_ID = "ninepointlabs.speakeasy"
+INTENT_PATH = os.path.join(STATE_DIR, "intent")
+
+
+def cmd_ui(a):
+    """Keybinding entry point: the Omarchy panel if it is there, else a terminal."""
+    shell = shutil.which("omarchy-shell")
+    if shell and subprocess.run([shell, "shell", "ping"], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode == 0:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(INTENT_PATH, "w") as f:
+            f.write(a.view + "\n")
+        # The panel reads the intent when it opens; bar-widget summons carry no
+        # payload. The list view toggles; the form always opens.
+        if a.view == "list":
+            r = subprocess.run([shell, PLUGIN_ID, "isOpen"], text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if r.stdout.strip() == "true":
+                subprocess.run([shell, "shell", "hide", PLUGIN_ID])
+                return
+        r = subprocess.run([shell, "shell", "summon", PLUGIN_ID, "{}"], text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if r.stdout.strip() == "ok":
+            return
+    prefix = terminal_prefix(config())
+    if not prefix:
+        die("no terminal emulator found")
+    inner = [sys.executable, SELF, "new", "-i", "-o"] if a.view == "new" else \
+        ["sh", "-c", f"{shlex.quote(sys.executable)} {shlex.quote(SELF)} list; echo; read -r -p 'Press Enter to close' _"]
+    subprocess.Popen(prefix + inner, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ------------------------------------------------------------------- main --
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="speakeasy", description="AI agents in hidden terminals, one named tab per task.")
+    p.add_argument("--version", action="version", version=f"speakeasy {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("new", help="start a task in a hidden terminal")
+    s.add_argument("-a", "--agent", default="claude")
+    s.add_argument("-m", "--model", default="")
+    s.add_argument("-t", "--title", default="")
+    s.add_argument("-p", "--prompt", default="", help="the task description; '-' reads stdin")
+    s.add_argument("-C", "--cwd", default="")
+    s.add_argument("-i", "--interactive", action="store_true", help="ask for everything")
+    s.add_argument("-o", "--open", action="store_true", help="also open its terminal now")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("extra", nargs="*", help="extra agent arguments, after --")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("list", aliases=["ls"], help="list tasks, attention first")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("open", help="show a task's terminal (or `next` waiting task)")
+    s.add_argument("ref")
+    s.set_defaults(fn=cmd_open)
+
+    s = sub.add_parser("peek", help="print the last lines of a task's screen")
+    s.add_argument("ref")
+    s.add_argument("-n", "--lines", type=int, default=30)
+    s.set_defaults(fn=cmd_peek)
+
+    s = sub.add_parser("send", help="type a line into a task and press Enter")
+    s.add_argument("ref")
+    s.add_argument("text", nargs="+")
+    s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser("rename", help="rename a task")
+    s.add_argument("ref")
+    s.add_argument("title", nargs="+")
+    s.set_defaults(fn=cmd_rename)
+
+    s = sub.add_parser("seen", help="clear a task's unseen mark")
+    s.add_argument("ref")
+    s.set_defaults(fn=cmd_seen)
+
+    s = sub.add_parser("stop", help="stop a task, keep it in the list")
+    s.add_argument("ref")
+    s.set_defaults(fn=cmd_stop)
+
+    s = sub.add_parser("rm", help="stop a task and remove it")
+    s.add_argument("ref")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("clear", help="remove every finished task")
+    s.set_defaults(fn=cmd_clear)
+
+    s = sub.add_parser("agents", help="show supported agents and which are installed")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_agents)
+
+    s = sub.add_parser("state", help="tasks, agents and defaults as JSON (for the panel)")
+    s.set_defaults(fn=cmd_state)
+
+    s = sub.add_parser("ui", help="show the task list or the new-task form (for keybindings)")
+    s.add_argument("view", nargs="?", default="list", choices=["list", "new"])
+    s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("hook", help=argparse.SUPPRESS)
+    s.add_argument("id")
+    s.add_argument("event")
+    s.add_argument("payload", nargs="*")
+    s.set_defaults(fn=cmd_hook)
+
+    s = sub.add_parser("_run", help=argparse.SUPPRESS)
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("_notify", help=argparse.SUPPRESS)
+    s.add_argument("id")
+    s.add_argument("urgency")
+    s.add_argument("title")
+    s.add_argument("body")
+    s.set_defaults(fn=cmd_notify_worker)
+
+    a = p.parse_args(argv)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

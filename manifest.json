@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "ninepointlabs.speakeasy",
+  "name": "Speakeasy",
+  "version": "0.1.0",
+  "author": "Ninepoint Labs",
+  "license": "MIT",
+  "description": "Run Claude Code, Codex and other AI agents in hidden terminals, one named tab per task. The bar shows what is running and what needs you; a notification or a keystroke opens the terminal only when you want to see it.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Speakeasy",
+    "description": "Your AI agent tasks, by name: which are working, which are done, which need an approval.",
+    "category": "AI",
+    "aliases": [
+      "speakeasy",
+      "agents",
+      "tasks",
+      "claude",
+      "codex"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showCounts": true
+    },
+    "schema": [
+      {
+        "key": "showCounts",
+        "type": "boolean",
+        "label": "Show task counts next to the icon",
+        "defaultValue": true
+      }
+    ]
+  }
+}

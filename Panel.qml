@@ -1,0 +1,948 @@
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+// The Speakeasy panel: the list of tasks (attention first), a peek at the
+// selected task's screen, and the form that starts a new one. Everything
+// runs through the bundled `speakeasy` CLI; this file only renders state
+// and forwards keys.
+Panel {
+  id: root
+  moduleName: "ninepointlabs.speakeasy"
+
+  property var anchorItem: null
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
+
+  readonly property string pluginDir: decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")).replace(/\/$/, "")
+  readonly property string cli: pluginDir + "/bin/speakeasy"
+  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/speakeasy"
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color accent: Color.accent
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property color faint: Qt.darker(foreground, 2.1)
+
+  // ---------------------------------------------------------------- state --
+
+  property var tasks: []
+  property var agentList: []
+  property var prefs: ({})
+  property bool loaded: false
+  property bool tmuxOk: true
+  property string error: ""
+  property real nowMs: Date.now()
+
+  readonly property int needsCount: countWhere(function(t) { return t.status === "needs-you" })
+  readonly property int doneCount: countWhere(function(t) { return t.status !== "needs-you" && t.unseen === true })
+  readonly property int workingCount: countWhere(function(t) { return t.status === "running" || t.status === "starting" })
+  readonly property int finishedCount: countWhere(function(t) { return t.status === "exited" || t.status === "stopped" })
+
+  function countWhere(pred) {
+    var n = 0
+    for (var i = 0; i < tasks.length; i++) if (pred(tasks[i])) n++
+    return n
+  }
+
+  // "list" or "new"
+  property string view: "list"
+  property int selected: 0
+  property bool peekOn: false
+  property string peekText: ""
+  property string confirmId: ""
+  readonly property var selectedTask: selected >= 0 && selected < tasks.length ? tasks[selected] : null
+
+  // New-task form. formFocus: 0 agent, 1 model, 2 title, 3 description, 4 folder
+  property int agentIndex: 0
+  property int modelIndex: 0
+  property int formFocus: 2
+  property bool starting: false
+  readonly property var installedAgents: agentList.filter(function(a) { return a.installed })
+  readonly property var currentAgent: agentIndex >= 0 && agentIndex < installedAgents.length ? installedAgents[agentIndex] : null
+  readonly property var currentModels: currentAgent ? currentAgent.models : []
+
+  function applyState(text) {
+    var data
+    try { data = JSON.parse(text) } catch (e) { error = "Could not read task state."; return }
+    var keepId = selectedTask ? selectedTask.id : ""
+    tasks = data.tasks || []
+    agentList = data.agents || []
+    prefs = data.prefs || ({})
+    tmuxOk = data.tmux !== false
+    loaded = true
+    nowMs = Date.now()
+    if (keepId !== "") {
+      for (var i = 0; i < tasks.length; i++) if (tasks[i].id === keepId) { selected = i; break }
+    }
+    if (selected >= tasks.length) selected = Math.max(0, tasks.length - 1)
+    if (confirmId !== "" && !tasks.some(function(t) { return t.id === confirmId })) confirmId = ""
+  }
+
+  property bool refreshQueued: false
+  function refresh() {
+    if (stateProc.running) { refreshQueued = true; return }
+    stateProc.running = true
+  }
+
+  function run(args, after) {
+    if (actionProc.running) { Quickshell.execDetached([cli].concat(args)); refresh(); return }
+    actionProc.after = after || null
+    actionProc.command = [cli].concat(args)
+    actionProc.running = true
+  }
+
+  // -------------------------------------------------------------- actions --
+
+  function move(delta) {
+    if (tasks.length === 0) return
+    confirmId = ""
+    selected = Math.max(0, Math.min(tasks.length - 1, selected + delta))
+    peekText = ""
+    if (peekOn) refreshPeek()
+    ensureVisible()
+  }
+
+  function openSelected() {
+    var t = selectedTask
+    if (!t) return
+    // A task that ended keeps its screen (tmux holds dead panes), so opening
+    // it shows the final output, unless the session itself is gone.
+    if (t.alive === false) { error = "That task's terminal is gone (after a reboot, say). Remove it with x."; return }
+    Quickshell.execDetached([cli, "open", t.id])
+    close()
+  }
+
+  function stopOrRemove() {
+    var t = selectedTask
+    if (!t) return
+    if (confirmId !== t.id) { confirmId = t.id; return }
+    confirmId = ""
+    var finished = t.status === "exited" || t.status === "stopped"
+    run([finished ? "rm" : "stop", t.id])
+  }
+
+  function clearFinished() {
+    if (finishedCount > 0) run(["clear"])
+  }
+
+  function togglePeek() {
+    peekOn = !peekOn
+    peekText = ""
+    if (peekOn) refreshPeek()
+  }
+
+  function refreshPeek() {
+    var t = selectedTask
+    if (!t || peekProc.running) return
+    peekProc.command = [cli, "peek", t.id, "-n", "14"]
+    peekProc.running = true
+  }
+
+  function showNew() {
+    confirmId = ""
+    error = ""
+    view = "new"
+    // Pre-select the last agent and model used.
+    var ai = 0
+    for (var i = 0; i < installedAgents.length; i++) if (installedAgents[i].id === prefs.agent) ai = i
+    agentIndex = ai
+    var mi = currentModels.indexOf(prefs.model || "")
+    modelIndex = mi >= 0 ? mi : 0
+    titleField.text = ""
+    descArea.text = ""
+    folderField.text = prefs.cwd || ""
+    setFormFocus(2)
+  }
+
+  function showList() {
+    view = "list"
+    error = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function setFormFocus(i) {
+    formFocus = Math.max(0, Math.min(4, i))
+    Qt.callLater(function() {
+      var target = [formKeys, formKeys, titleField, descArea, folderField][root.formFocus]
+      if (target) target.forceActiveFocus()
+    })
+  }
+
+  function cycleChoice(delta) {
+    if (formFocus === 0 && installedAgents.length > 0) {
+      agentIndex = (agentIndex + delta + installedAgents.length) % installedAgents.length
+      modelIndex = 0
+    } else if (formFocus === 1 && currentModels.length > 0) {
+      modelIndex = (modelIndex + delta + currentModels.length) % currentModels.length
+    }
+  }
+
+  function submit() {
+    if (!currentAgent || starting) return
+    var title = titleField.text.trim()
+    var prompt = descArea.text.trim()
+    if (title === "" && prompt === "") { error = "Give the task a title or a description."; setFormFocus(2); return }
+    error = ""
+    starting = true
+    var args = ["new", "--json", "-a", currentAgent.id, "-t", title, "-p", prompt]
+    var model = currentModels[modelIndex] || ""
+    if (model !== "") args.push("-m", model)
+    if (folderField.text.trim() !== "") args.push("-C", folderField.text.trim())
+    run(args, function(code, out, err) {
+      root.starting = false
+      if (code !== 0) { root.error = (err || "Could not start the task.").replace(/^speakeasy: /, ""); return }
+      var id = ""
+      try { id = JSON.parse(out).id } catch (e) {}
+      root.pendingSelectId = id
+      root.showList()
+    })
+  }
+  property string pendingSelectId: ""
+  onTasksChanged: {
+    if (pendingSelectId === "") return
+    for (var i = 0; i < tasks.length; i++) if (tasks[i].id === pendingSelectId) { selected = i; pendingSelectId = ""; break }
+  }
+
+  function ensureVisible() {
+    Qt.callLater(function() {
+      var row = taskRepeater.itemAt(root.selected)
+      if (!row) return
+      if (row.y < listFlick.contentY) listFlick.contentY = row.y
+      else if (row.y + row.height > listFlick.contentY + listFlick.height)
+        listFlick.contentY = row.y + row.height - listFlick.height
+    })
+  }
+
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    return false
+  }
+
+  // Headless test hook: drive the panel by key name over IPC.
+  function ipcKey(name) {
+    if (!opened) return "closed"
+    if (view === "list") {
+      if (name === "down") move(1)
+      else if (name === "up") move(-1)
+      else if (name === "enter") openSelected()
+      else if (name === "n") showNew()
+      else if (name === "p") togglePeek()
+      else if (name === "x") stopOrRemove()
+      else if (name === "c") clearFinished()
+      else if (name === "esc") { if (confirmId !== "") confirmId = ""; else close() }
+      else return "unknown key"
+    } else {
+      if (name === "esc") showList()
+      else if (name === "tab") setFormFocus(formFocus + 1)
+      else if (name === "left") cycleChoice(-1)
+      else if (name === "right") cycleChoice(1)
+      else if (name === "submit") submit()
+      else if (name.indexOf("title:") === 0) titleField.text = name.slice(6)
+      else if (name.indexOf("desc:") === 0) descArea.text = name.slice(5)
+      else if (name.indexOf("folder:") === 0) folderField.text = name.slice(7)
+      else return "unknown key"
+    }
+    return "ok"
+  }
+
+  function renderTo(path) {
+    if (!/^\/.*\.png$/.test(path) || path.indexOf("/../") !== -1) return "bad path"
+    content.grabToImage(function(result) { result.saveToFile(path) })
+    return "ok"
+  }
+
+  // ---------------------------------------------------------- formatting --
+
+  function age(iso) {
+    var t = Date.parse(iso)
+    if (isNaN(t)) return ""
+    var s = Math.max(0, Math.round((nowMs - t) / 1000))
+    if (s < 60) return "now"
+    if (s < 3600) return Math.floor(s / 60) + "m"
+    if (s < 86400) return Math.floor(s / 3600) + "h"
+    return Math.floor(s / 86400) + "d"
+  }
+
+  function folderName(path) {
+    var home = Quickshell.env("HOME")
+    if (path === home) return "~"
+    if (path.indexOf(home + "/") === 0) path = "~" + path.slice(home.length)
+    return path
+  }
+
+  function statusGlyph(s) {
+    if (s === "needs-you") return String.fromCodePoint(0xF0028)
+    if (s === "ready") return String.fromCodePoint(0xF0369)
+    if (s === "running") return String.fromCodePoint(0xF0996)
+    if (s === "starting") return String.fromCodePoint(0xF051F)
+    if (s === "stopped") return String.fromCodePoint(0xF0666)
+    return String.fromCodePoint(0xF05E0)
+  }
+
+  function statusColor(t) {
+    if (t.status === "needs-you") return urgent
+    if (t.status === "ready") return accent
+    if (t.status === "exited" && t.exitCode !== 0 && t.exitCode !== null) return urgent
+    if (t.status === "running" || t.status === "starting") return foreground
+    return faint
+  }
+
+  function statusLabel(s) {
+    return ({ "needs-you": "needs you", "ready": "done", "running": "working", "starting": "starting",
+              "exited": "ended", "stopped": "stopped" })[s] || s
+  }
+
+  function modelLabel(m) { return m === "" ? "default" : m }
+
+  readonly property string subtitle: {
+    if (!loaded) return "Loading…"
+    if (tasks.length === 0) return "No tabs open"
+    var bits = []
+    if (needsCount > 0) bits.push(needsCount + " need" + (needsCount === 1 ? "s" : "") + " you")
+    if (doneCount > 0) bits.push(doneCount + " done")
+    if (workingCount > 0) bits.push(workingCount + " working")
+    if (bits.length === 0) bits.push(tasks.length + " tab" + (tasks.length === 1 ? "" : "s"))
+    return bits.join("  ·  ")
+  }
+
+  implicitWidth: 1
+  implicitHeight: 1
+
+  onOpenedChanged: {
+    confirmId = ""
+    if (!opened) { peekOn = false; return }
+    view = "list"
+    refresh()
+    intentProc.running = true
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  Component.onCompleted: refresh()
+
+  // ------------------------------------------------------------ processes --
+
+  Process {
+    id: stateProc
+    command: [root.cli, "state"]
+    running: false
+    stdout: StdioCollector { id: stateOut }
+    stderr: StdioCollector { id: stateErr }
+    onExited: function(code) {
+      if (code === 0) { root.error = root.view === "list" ? "" : root.error; root.applyState(stateOut.text) }
+      else root.error = (stateErr.text || "speakeasy state failed").trim()
+      if (root.refreshQueued) { root.refreshQueued = false; Qt.callLater(root.refresh) }
+    }
+  }
+
+  Process {
+    id: actionProc
+    property var after: null
+    running: false
+    stdout: StdioCollector { id: actionOut }
+    stderr: StdioCollector { id: actionErr }
+    onExited: function(code) {
+      var cb = actionProc.after
+      actionProc.after = null
+      if (cb) cb(code, actionOut.text, actionErr.text.trim())
+      else if (code !== 0) root.error = actionErr.text.trim().replace(/^speakeasy: /, "")
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: peekProc
+    running: false
+    stdout: StdioCollector { id: peekOut }
+    onExited: function(code) { root.peekText = code === 0 ? peekOut.text.replace(/\s+$/, "") : "" }
+  }
+
+  // `speakeasy ui new` leaves an intent file, because bar-widget summons
+  // carry no payload. Read it (and remove it) whenever the panel opens.
+  Process {
+    id: intentProc
+    running: false
+    command: ["sh", "-c", "cat \"$1\" 2>/dev/null; rm -f \"$1\"", "sh", root.stateDir + "/intent"]
+    stdout: StdioCollector { id: intentOut }
+    onExited: {
+      if (intentOut.text.trim() === "new") {
+        if (root.loaded) root.showNew()
+        else root.pendingNew = true
+      }
+    }
+  }
+  property bool pendingNew: false
+  onLoadedChanged: if (loaded && pendingNew) { pendingNew = false; showNew() }
+
+  // The CLI touches `rev` on every state change, hooks included.
+  FileView {
+    path: root.stateDir + "/rev"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: { reload(); root.refresh() }
+  }
+
+  Timer {
+    interval: root.opened ? 4000 : 20000
+    repeat: true
+    running: true
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.opened && root.peekOn && root.view === "list"
+    onTriggered: root.refreshPeek()
+  }
+
+  // --------------------------------------------------------------- pieces --
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
+    bar: root.bar
+    open: root.opened
+    focusTarget: root.view === "list" ? keyCatcher : titleField
+    contentWidth: panel.fittedContentWidth(Style.space(620))
+    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(900))
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: root.view !== "list"
+      onCloseRequested: {
+        if (root.confirmId !== "") { root.confirmId = ""; return }
+        if (root.peekOn) { root.peekOn = false; return }
+        root.close()
+      }
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) { if (dy !== 0) root.move(dy) }
+      onActivateRequested: {
+        if (root.confirmId !== "") root.stopOrRemove()
+        else root.openSelected()
+      }
+      onDeleteRequested: root.stopOrRemove()
+      onTextKey: function(t) {
+        if (t === "n" || t === "N") root.showNew()
+        else if (t === "p" || t === "P") root.togglePeek()
+        else if (t === "c" || t === "C") root.clearFinished()
+        else if (t === "y" && root.confirmId !== "") root.stopOrRemove()
+      }
+
+      Column {
+        id: content
+        anchors.fill: parent
+        spacing: Style.space(10)
+
+        // ------------------------------------------------------- header --
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(titleColumn.implicitHeight, headerActions.implicitHeight)
+
+          Column {
+            id: titleColumn
+            anchors.left: parent.left
+            anchors.right: headerActions.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
+            Row {
+              spacing: Style.space(6)
+              Text {
+                textFormat: Text.PlainText
+                text: String.fromCodePoint(0xF0356)
+                color: root.needsCount > 0 ? root.urgent : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: root.view === "new" ? "New task" : "Speakeasy"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.view === "new" ? "Runs in a hidden terminal. You get a notification when it needs you or is done." : root.subtitle
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+          }
+
+          Row {
+            id: headerActions
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+
+            Button {
+              visible: root.view === "list" && root.finishedCount > 0
+              text: "Clear finished"
+              tooltipText: "Remove every ended or stopped task (c)"
+              foreground: root.dim
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(3)
+              onClicked: root.clearFinished()
+            }
+            Button {
+              visible: root.view === "list"
+              iconText: String.fromCodePoint(0xF0415)
+              text: "New task"
+              tooltipText: "Start a task in a hidden terminal (n)"
+              bordered: true
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              iconSize: Style.font.body
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(3)
+              onClicked: root.showNew()
+            }
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        // ------------------------------------------------ setup problems --
+        Text {
+          visible: root.loaded && !root.tmuxOk
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Speakeasy needs tmux to keep terminals out of sight. Install it with `omarchy pkg add tmux` (or your distribution's package manager)."
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+
+        // ---------------------------------------------------------- list --
+        Text {
+          visible: root.view === "list" && root.loaded && root.tasks.length === 0
+          width: parent.width
+          topPadding: Style.space(8)
+          bottomPadding: Style.space(8)
+          textFormat: Text.PlainText
+          text: "Nothing on the tab. Press n to hand an agent a task; it works out of sight and taps you on the shoulder when it needs you."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          wrapMode: Text.Wrap
+        }
+
+        Flickable {
+          id: listFlick
+          visible: root.view === "list" && root.tasks.length > 0
+          width: parent.width
+          height: Math.min(listColumn.implicitHeight, Style.space(root.peekOn ? 300 : 520))
+          contentWidth: width
+          contentHeight: listColumn.implicitHeight
+          boundsBehavior: Flickable.StopAtBounds
+          clip: true
+
+          Column {
+            id: listColumn
+            width: listFlick.width
+            spacing: Style.space(6)
+
+            Repeater {
+              id: taskRepeater
+              model: root.tasks
+
+              Rectangle {
+                id: row
+                required property var modelData
+                required property int index
+                readonly property bool isSelected: index === root.selected
+                readonly property bool confirming: root.confirmId === modelData.id
+                readonly property bool finished: modelData.status === "exited" || modelData.status === "stopped"
+                width: listColumn.width
+                radius: Style.cornerRadius
+                color: isSelected || rowMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : Style.normalFillFor(root.foreground, root.accent)
+                border.width: isSelected ? Math.max(1, Style.space(2)) : Style.spacing.hairline
+                border.color: isSelected ? root.accent : Style.normalBorderFor(root.foreground, root.accent)
+                implicitHeight: rowColumn.implicitHeight + Style.space(16)
+
+                MouseArea {
+                  id: rowMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: { root.selected = row.index; root.openSelected() }
+                }
+
+                Text {
+                  id: rowGlyph
+                  anchors.left: parent.left
+                  anchors.top: parent.top
+                  anchors.leftMargin: Style.space(10)
+                  anchors.topMargin: Style.space(8)
+                  textFormat: Text.PlainText
+                  text: root.statusGlyph(modelData.status)
+                  color: root.statusColor(modelData)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                }
+
+                Column {
+                  id: rowColumn
+                  anchors.left: rowGlyph.right
+                  anchors.right: parent.right
+                  anchors.top: parent.top
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  anchors.topMargin: Style.space(8)
+                  spacing: Style.space(2)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: titleText.implicitHeight
+
+                    Text {
+                      id: titleText
+                      anchors.left: parent.left
+                      anchors.right: stateText.left
+                      anchors.rightMargin: Style.space(8)
+                      textFormat: Text.PlainText
+                      text: (modelData.unseen ? "● " : "") + modelData.title
+                      color: row.finished ? root.dim : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: modelData.unseen === true || modelData.status === "needs-you"
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      id: stateText
+                      anchors.right: parent.right
+                      textFormat: Text.PlainText
+                      text: root.statusLabel(modelData.status) + "  " + root.age(modelData.updatedAt)
+                      color: root.statusColor(modelData)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: modelData.agentName + (modelData.model ? " · " + modelData.model : "") + "  ·  " + root.folderName(modelData.cwd) + (modelData.attached ? "  ·  on screen" : "")
+                    color: root.faint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideMiddle
+                  }
+
+                  Text {
+                    visible: text !== ""
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: row.confirming
+                      ? (row.finished ? "Remove this task and its terminal? x or Enter to confirm, Esc to cancel" : "Stop this task? x or Enter to confirm, Esc to cancel")
+                      : (modelData.detail || "")
+                    color: row.confirming ? root.urgent : (modelData.status === "needs-you" ? root.urgent : root.dim)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.Wrap
+                    maximumLineCount: 2
+                    elide: Text.ElideRight
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // ---------------------------------------------------------- peek --
+        Rectangle {
+          visible: root.view === "list" && root.peekOn && root.selectedTask !== null
+          width: parent.width
+          height: Style.space(260)
+          radius: Style.cornerRadius
+          color: Qt.rgba(0, 0, 0, 0.25)
+          border.width: Style.spacing.hairline
+          border.color: Style.normalBorderFor(root.foreground, root.accent)
+          clip: true
+
+          Text {
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            textFormat: Text.PlainText
+            text: root.peekText !== "" ? root.peekText : "…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.NoWrap
+            elide: Text.ElideRight
+            verticalAlignment: Text.AlignBottom
+          }
+        }
+
+        // ---------------------------------------------------------- form --
+        Column {
+          visible: root.view === "new"
+          width: parent.width
+          spacing: Style.space(10)
+
+          Text {
+            visible: root.installedAgents.length === 0
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "No supported agent is installed. Speakeasy knows Claude Code, Codex, Gemini CLI, opencode, Cursor Agent and Crush; others can be added in ~/.config/speakeasy/config.json."
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
+          }
+
+          // Agent and model pickers share one key handler: ←/→ choose,
+          // Tab / ↓ move on.
+          FocusScope {
+            id: formKeys
+            width: parent.width
+            implicitHeight: pickerColumn.implicitHeight
+            activeFocusOnTab: false
+
+            Keys.onPressed: function(event) {
+              var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+              if (event.key === Qt.Key_Escape) { root.showList(); event.accepted = true }
+              else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && ctrl) { root.submit(); event.accepted = true }
+              else if (event.key === Qt.Key_Left || event.text === "h") { root.cycleChoice(-1); event.accepted = true }
+              else if (event.key === Qt.Key_Right || event.text === "l") { root.cycleChoice(1); event.accepted = true }
+              else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up) { root.setFormFocus(root.formFocus - 1); event.accepted = true }
+              else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                root.setFormFocus(root.formFocus === 0 && root.currentModels.length <= 1 ? 2 : root.formFocus + 1)
+                event.accepted = true
+              }
+            }
+
+            Column {
+              id: pickerColumn
+              width: parent.width
+              spacing: Style.space(8)
+
+              Repeater {
+                model: [0, 1]
+
+                Row {
+                  id: pickRow
+                  required property int modelData
+                  readonly property bool isAgents: modelData === 0
+                  readonly property bool focused: formKeys.activeFocus && root.formFocus === modelData
+                  readonly property var choices: isAgents ? root.installedAgents : root.currentModels
+                  visible: isAgents || root.currentModels.length > 1
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Text {
+                    width: Style.space(84)
+                    textFormat: Text.PlainText
+                    text: pickRow.isAgents ? "Agent" : "Model"
+                    color: pickRow.focused ? root.accent : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: pickRow.focused
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Repeater {
+                    model: pickRow.choices
+
+                    Rectangle {
+                      id: chip
+                      required property var modelData
+                      required property int index
+                      readonly property bool chosen: pickRow.isAgents ? index === root.agentIndex : index === root.modelIndex
+                      radius: Style.cornerRadius
+                      implicitWidth: chipText.implicitWidth + Style.space(18)
+                      implicitHeight: chipText.implicitHeight + Style.space(8)
+                      color: chosen ? Style.hoverFillFor(root.foreground, root.accent) : "transparent"
+                      border.width: chosen ? Math.max(1, Style.space(2)) : Style.spacing.hairline
+                      border.color: chosen ? (pickRow.focused ? root.accent : root.dim) : Style.normalBorderFor(root.foreground, root.accent)
+
+                      Text {
+                        id: chipText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: pickRow.isAgents ? chip.modelData.name : root.modelLabel(chip.modelData)
+                        color: chip.chosen ? root.foreground : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: chip.chosen
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          if (pickRow.isAgents) { root.agentIndex = chip.index; root.modelIndex = 0 }
+                          else root.modelIndex = chip.index
+                          root.setFormFocus(pickRow.modelData)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Title"
+            color: titleField.activeFocus ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+          TextField {
+            id: titleField
+            width: parent.width
+            placeholderText: "What the tab is called, e.g. Fix the login redirect"
+            foreground: root.foreground
+            accent: root.accent
+            font.family: root.fontFamily
+            onActiveFocusChanged: if (activeFocus) root.formFocus = 2
+            Keys.onReturnPressed: function(event) { if (event.modifiers & Qt.ControlModifier) root.submit(); else root.setFormFocus(3) }
+            Keys.onEnterPressed: function(event) { if (event.modifiers & Qt.ControlModifier) root.submit(); else root.setFormFocus(3) }
+            Keys.onTabPressed: root.setFormFocus(3)
+            Keys.onBacktabPressed: root.setFormFocus(root.currentModels.length > 1 ? 1 : 0)
+            Keys.onEscapePressed: root.showList()
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Description"
+            color: descArea.activeFocus ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+          Rectangle {
+            width: parent.width
+            height: Style.space(150)
+            radius: Style.cornerRadius
+            color: Style.controlFill(descArea.activeFocus, false, root.foreground, root.accent)
+            border.width: descArea.activeFocus ? Math.max(1, Style.space(2)) : Style.spacing.hairline
+            border.color: descArea.activeFocus ? root.accent : Style.normalBorderFor(root.foreground, root.accent)
+
+            ScrollView {
+              anchors.fill: parent
+              anchors.margins: Style.space(2)
+
+              TextArea {
+                id: descArea
+                placeholderText: "Tell the agent what to do. Enter adds a line; Ctrl+Enter starts the task."
+                placeholderTextColor: Qt.darker(root.foreground, 1.6)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: TextEdit.Wrap
+                selectByMouse: true
+                background: null
+                onActiveFocusChanged: if (activeFocus) root.formFocus = 3
+                Keys.onPressed: function(event) {
+                  var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+                  if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && ctrl) { root.submit(); event.accepted = true }
+                  else if (event.key === Qt.Key_Tab) { root.setFormFocus(4); event.accepted = true }
+                  else if (event.key === Qt.Key_Backtab) { root.setFormFocus(2); event.accepted = true }
+                  else if (event.key === Qt.Key_Escape) { root.showList(); event.accepted = true }
+                }
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Folder"
+            color: folderField.activeFocus ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+          TextField {
+            id: folderField
+            width: parent.width
+            placeholderText: "~/Projects/something"
+            foreground: root.foreground
+            accent: root.accent
+            font.family: root.fontFamily
+            onActiveFocusChanged: if (activeFocus) root.formFocus = 4
+            Keys.onReturnPressed: root.submit()
+            Keys.onEnterPressed: root.submit()
+            Keys.onTabPressed: root.setFormFocus(0)
+            Keys.onBacktabPressed: root.setFormFocus(3)
+            Keys.onEscapePressed: root.showList()
+          }
+
+          Row {
+            spacing: Style.space(6)
+            Button {
+              text: root.starting ? "Starting…" : "Start task"
+              bordered: true
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.body
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              onClicked: root.submit()
+            }
+            Button {
+              text: "Back"
+              foreground: root.dim
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.body
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              onClicked: root.showList()
+            }
+          }
+        }
+
+        // --------------------------------------------------------- error --
+        Text {
+          visible: root.error !== ""
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.error
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+
+        // --------------------------------------------------------- hints --
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.view === "new"
+            ? "Tab next field  ·  ←→ choose  ·  Ctrl+Enter start  ·  Esc back"
+            : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear finished  ·  Esc close"
+                                     : "n new  ·  Esc close")
+          color: root.faint
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+    }
+  }
+}

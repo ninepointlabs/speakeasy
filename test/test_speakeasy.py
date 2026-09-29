@@ -1,0 +1,174 @@
+"""Tests for the speakeasy CLI. Run: python3 -m unittest discover -s test
+
+State and config go to a temporary XDG directory with notifications off, so
+nothing touches your real tasks. The end-to-end test needs tmux.
+"""
+
+import atexit
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLI = os.path.join(ROOT, "bin", "speakeasy")
+TMP = tempfile.mkdtemp(prefix="speakeasy-test-")
+atexit.register(shutil.rmtree, TMP, True)
+os.environ["XDG_STATE_HOME"] = os.path.join(TMP, "state")
+os.environ["XDG_CONFIG_HOME"] = os.path.join(TMP, "config")
+os.makedirs(os.path.join(TMP, "config", "speakeasy"))
+FAKE = os.path.join(TMP, "fake-agent")
+with open(FAKE, "w") as f:
+    f.write('#!/bin/sh\necho "args: $*"\nsleep 1\necho finished\nexit 3\n')
+os.chmod(FAKE, 0o755)
+with open(os.path.join(TMP, "config", "speakeasy", "config.json"), "w") as f:
+    json.dump({"notify": False, "quietSeconds": 2,
+               "agents": {"fake": {"name": "Fake", "bin": FAKE, "prompt": "arg",
+                                   "models": ["", "big"], "modelFlag": "--model"}}}, f)
+
+loader = importlib.machinery.SourceFileLoader("speakeasy", CLI)
+spec = importlib.util.spec_from_loader("speakeasy", loader)
+se = importlib.util.module_from_spec(spec)
+loader.exec_module(se)
+# Tests run tmux on their own socket so they never see real tasks.
+se.SOCKET = "speakeasy-test-%d" % os.getpid()
+
+
+def make_task(tid="abc123", agent="claude", **kw):
+    task = {"id": tid, "title": "Fix login", "prompt": "fix it", "agent": agent, "agentName": agent,
+            "model": "", "cwd": TMP, "args": [], "status": "running", "detail": "", "unseen": False,
+            "createdAt": se.now(), "updatedAt": se.now(), "exitCode": None, "sessionId": ""}
+    task.update(kw)
+    se.write_json(se.task_path(tid), task)
+    return task
+
+
+def hook(tid, event, payload=None, argv_payload=None):
+    args = ["hook", tid, event] + ([json.dumps(argv_payload)] if argv_payload is not None else [])
+    old = sys.stdin
+    sys.stdin = io.StringIO(json.dumps(payload or {}))
+    try:
+        se.main(args)
+    finally:
+        sys.stdin = old
+    return se.load_task(tid)
+
+
+class Pure(unittest.TestCase):
+    def test_first_line_skips_markdown_and_blank_lines(self):
+        self.assertEqual(se.first_line("\n\n## Done\nmore"), "Done")
+        self.assertEqual(se.first_line("x" * 200, 10), "x" * 9 + "…")
+
+    def test_codex_title_turn(self):
+        self.assertTrue(se.is_codex_title_turn('{"title":"Tell a joke"}'))
+        self.assertFalse(se.is_codex_title_turn("A normal reply"))
+        self.assertFalse(se.is_codex_title_turn('{"title":"x","other":1}'))
+
+    def test_describe_tool(self):
+        self.assertEqual(se.describe_tool("Bash", {"command": "npm test\nmore"}), "run: npm test")
+        self.assertEqual(se.describe_tool("Edit", {"file_path": "/a/b/app.py"}), "edit app.py")
+        self.assertEqual(se.describe_tool("Write", {"file_path": "/a/new.txt"}), "write new.txt")
+        self.assertEqual(se.describe_tool("Task", {}), "use Task")
+
+    def test_claude_command_has_model_name_hooks_and_prompt_last(self):
+        task = make_task(model="opus")
+        argv, typed = se.build_command(task, se.agent_by_id("claude"))
+        self.assertEqual(argv[1:3], ["--model", "opus"])
+        self.assertEqual(argv[argv.index("--name") + 1], "Fix login")
+        hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+        self.assertIn("Stop", hooks)
+        self.assertIn("PermissionRequest", hooks)
+        self.assertIn(" hook abc123 Stop", hooks["Stop"][0]["hooks"][0]["command"])
+        self.assertEqual(argv[-1], "fix it")
+        self.assertEqual(typed, "")
+
+    def test_codex_command_sets_notify(self):
+        argv, _ = se.build_command(make_task(agent="codex"), se.agent_by_id("codex"))
+        notify = [a for a in argv if a.startswith("notify=")][0]
+        self.assertEqual(json.loads(notify[len("notify="):])[-2:], ["abc123", "codex"])
+
+    def test_prompt_delivery_modes(self):
+        argv, _ = se.build_command(make_task(agent="gemini"), se.agent_by_id("gemini"))
+        self.assertEqual(argv[-2:], ["-i", "fix it"])
+        argv, typed = se.build_command(make_task(agent="crush"), se.agent_by_id("crush"))
+        self.assertNotIn("fix it", argv)
+        self.assertEqual(typed, "fix it")
+
+    def test_default_model_adds_no_flag(self):
+        argv, _ = se.build_command(make_task(model=""), se.agent_by_id("claude"))
+        self.assertNotIn("--model", argv)
+
+
+class Hooks(unittest.TestCase):
+    def test_claude_lifecycle(self):
+        make_task(status="starting")
+        t = hook("abc123", "SessionStart", {"session_id": "s-1"})
+        self.assertEqual((t["status"], t["sessionId"]), ("running", "s-1"))
+        hook("abc123", "PermissionRequest", {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}})
+        t = hook("abc123", "Notification", {"notification_type": "permission_prompt", "message": "Claude needs your permission"})
+        self.assertEqual((t["status"], t["detail"], t["unseen"]), ("needs-you", "Wants to run: rm -rf build", True))
+        t = hook("abc123", "PostToolUse", {})
+        self.assertEqual((t["status"], t["pendingAsk"]), ("running", ""))
+        t = hook("abc123", "Stop", {"last_assistant_message": "## All tests pass\n\nDetails…"})
+        self.assertEqual((t["status"], t["detail"]), ("ready", "All tests pass"))
+        # The idle reminder after a finished turn is not news.
+        t = hook("abc123", "Notification", {"notification_type": "idle_prompt", "message": "waiting"})
+        self.assertEqual(t["status"], "ready")
+
+    def test_finished_task_ignores_late_hooks(self):
+        make_task(status="stopped")
+        self.assertEqual(hook("abc123", "Stop", {"last_assistant_message": "hi"})["status"], "stopped")
+
+    def test_codex_notify(self):
+        make_task(agent="codex")
+        t = hook("abc123", "codex", argv_payload={"type": "agent-turn-complete", "last-assistant-message": '{"title":"x"}'})
+        self.assertEqual(t["status"], "running")
+        t = hook("abc123", "codex", argv_payload={"type": "agent-turn-complete", "last-assistant-message": "Fixed it."})
+        self.assertEqual((t["status"], t["detail"]), ("ready", "Fixed it."))
+
+
+@unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+class EndToEnd(unittest.TestCase):
+    def run_cli(self, *args):
+        env = dict(os.environ, PATH=os.environ["PATH"])
+        # The subprocess must use the same private socket as this test.
+        code = "import importlib.machinery,sys;" \
+               f"m=importlib.machinery.SourceFileLoader('se',{CLI!r}).load_module();" \
+               f"m.SOCKET={se.SOCKET!r};sys.argv=['speakeasy']+{list(args)!r};m.main()"
+        return subprocess.run([sys.executable, "-c", code], text=True, capture_output=True, env=env)
+
+    def tearDown(self):
+        subprocess.run(["tmux", "-L", se.SOCKET, "kill-server"], capture_output=True)
+
+    def test_fake_agent_runs_hidden_and_exit_is_recorded(self):
+        r = self.run_cli("new", "--json", "-a", "fake", "-m", "big", "-t", "Hidden", "-p", "do the thing", "-C", TMP)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tid = json.loads(r.stdout)["id"]
+        # The wrapper runs the agent under the tmux session created with the
+        # real socket name baked into the command, so check via task state.
+        for _ in range(40):
+            t = se.load_task(tid)
+            if t["status"] == "exited":
+                break
+            time.sleep(0.25)
+        self.assertEqual(t["status"], "exited")
+        self.assertEqual(t["exitCode"], 3)
+        self.assertTrue(t["unseen"])
+
+    def test_unknown_agent_and_missing_folder_fail_cleanly(self):
+        r = self.run_cli("new", "-a", "nope", "-t", "x")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unknown agent", r.stderr)
+        r = self.run_cli("new", "-a", "fake", "-t", "x", "-C", "/does/not/exist")
+        self.assertIn("folder does not exist", r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
