@@ -134,6 +134,18 @@ class Hooks(unittest.TestCase):
         self.assertEqual((t["status"], t["detail"]), ("ready", "Fixed it."))
 
 
+class State(unittest.TestCase):
+    def test_deleted_remembered_folder_falls_back_to_default(self):
+        se.write_json(se.PREFS_PATH, {"agent": "claude", "model": "", "cwd": "/does/not/exist"})
+        out = io.StringIO()
+        old, sys.stdout = sys.stdout, out
+        try:
+            se.main(["state"])
+        finally:
+            sys.stdout = old
+        self.assertEqual(json.loads(out.getvalue())["prefs"]["cwd"], os.path.expanduser("~"))
+
+
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
 class EndToEnd(unittest.TestCase):
     def run_cli(self, *args):

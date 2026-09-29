@@ -713,6 +713,10 @@ def cmd_state(a):
     cfg = config()
     tasks = sorted(reconcile(all_tasks()), key=sort_key)
     prefs = load_json(PREFS_PATH, {})
+    # The remembered folder may have been deleted since; fall back rather
+    # than pre-fill a path that `new` would refuse.
+    if prefs.get("cwd") and not os.path.isdir(prefs["cwd"]):
+        prefs["cwd"] = ""
     out = {
         "version": VERSION,
         "tmux": shutil.which("tmux") is not None,
