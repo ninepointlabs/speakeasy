@@ -41,6 +41,7 @@ Panel {
   // ---------------------------------------------------------------- state --
 
   property var tasks: []
+  property var externalSessions: []
   property var agentList: []
   property var prefs: ({})
   property bool loaded: false
@@ -82,6 +83,7 @@ Panel {
   // New-task form. formFocus: 0 agent, 1 model, 2 effort, 3 title,
   // 4 description, 5 folder. Rows an agent has no use for are skipped.
   property int agentIndex: 0
+  property int sessionIndex: 0
   property int modelIndex: 0
   property string effort: ""
   property int formFocus: 3
@@ -191,6 +193,8 @@ Panel {
     try { data = JSON.parse(text) } catch (e) { error = "Could not read task state."; return }
     var keepId = selectedTask ? selectedTask.id : ""
     tasks = data.tasks || []
+    externalSessions = (data.externalSessions || []).filter(function(s) { return !/^se-[0-9a-f]{6}$/.test(s.name) })
+    if (sessionIndex >= externalSessions.length) sessionIndex = Math.max(0, externalSessions.length - 1)
     agentList = data.agents || []
     appSettings = data.settings || ({})
     defaultCwdPath = data.defaultCwd || ""
@@ -339,8 +343,25 @@ Panel {
     keyCatcher.forceActiveFocus()
   }
 
+  function showSessions() {
+    confirmId = ""
+    peekOn = false
+    view = "sessions"
+    sessionIndex = 0
+    error = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function openSession() {
+    var s = externalSessions[sessionIndex]
+    if (!s) return
+    Quickshell.execDetached([cli, "open", "--external", s.name])
+    dismiss()
+  }
+
   function showList() {
     view = "list"
+    sessionIndex = 0
     error = ""
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -426,6 +447,7 @@ Panel {
       else return "unknown key"
     } else if (view === "list") {
       if (name === "s") showSettings()
+      else if (name === "v") showSessions()
       else if (name === "down") move(1)
       else if (name === "up") move(-1)
       else if (name === "enter") openSelected()
@@ -435,6 +457,12 @@ Panel {
       else if (name === "c") clearDone()
       else if (name === "C") clearAllDone()
       else if (name === "esc") { if (confirmId !== "") confirmId = ""; else dismiss() }
+      else return "unknown key"
+    } else if (view === "sessions") {
+      if (name === "down") sessionIndex = Math.max(0, Math.min(externalSessions.length - 1, sessionIndex + 1))
+      else if (name === "up") sessionIndex = Math.max(0, Math.min(externalSessions.length - 1, sessionIndex - 1))
+      else if (name === "enter") openSession()
+      else if (name === "esc") showList()
       else return "unknown key"
     } else {
       if (name === "esc") showList()
@@ -724,7 +752,7 @@ Panel {
       anchors.fill: parent
       blocked: root.view === "new" || cwdField.activeFocus
       onCloseRequested: {
-        if (root.view === "settings") { root.showList(); return }
+        if (root.view === "settings" || root.view === "sessions") { root.showList(); return }
         if (root.confirmClearAll) { root.confirmClearAll = false; return }
         if (root.notice !== "") { root.notice = ""; return }
         if (root.confirmId !== "") { root.confirmId = ""; return }
@@ -735,10 +763,12 @@ Panel {
       onMoveRequested: function(dx, dy) {
         if (dy === 0) return
         if (root.view === "settings") root.moveSetting(dy)
+        else if (root.view === "sessions") root.sessionIndex = Math.max(0, Math.min(root.externalSessions.length - 1, root.sessionIndex + dy))
         else root.move(dy)
       }
       onActivateRequested: {
         if (root.view === "settings") root.activateSetting()
+        else if (root.view === "sessions") root.openSession()
         else if (root.confirmClearAll) root.clearAllDone()
         else if (root.confirmId !== "") root.stopOrRemove()
         else root.openSelected()
@@ -746,7 +776,8 @@ Panel {
       onDeleteRequested: if (root.view === "list") root.stopOrRemove()
       onTextKey: function(t) {
         if (root.view !== "list") return
-        if (t === "n" || t === "N") root.showNew()
+        if (t === "v" || t === "V") root.showSessions()
+        else if (t === "n" || t === "N") root.showNew()
         else if (t === "s" || t === "S") root.showSettings()
         else if (t === "p" || t === "P") root.togglePeek()
         else if (t === "c") root.clearDone()
@@ -785,7 +816,7 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.view === "new" ? "New task" : (root.view === "settings" ? "Settings" : "Speakeasy")
+                text: root.view === "new" ? "New task" : (root.view === "settings" ? "Settings" : (root.view === "sessions" ? "Sessions" : "Speakeasy"))
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -798,7 +829,8 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: root.view === "new" ? "Runs in a hidden terminal. You get a notification when it needs you or is done."
-                : (root.view === "settings" ? "Choose which agents appear when you start a task." : root.subtitle)
+                : (root.view === "settings" ? "Choose which agents appear when you start a task."
+                : (root.view === "sessions" ? root.externalSessions.length + (root.externalSessions.length === 1 ? " tmux session" : " tmux sessions") : root.subtitle))
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -1030,6 +1062,99 @@ Panel {
             elide: Text.ElideRight
             verticalAlignment: Text.AlignBottom
           }
+        }
+
+        // ----------------------------------------------------- sessions --
+        Flickable {
+          visible: root.view === "sessions" && root.externalSessions.length > 0
+          width: parent.width
+          height: Math.min(sessionsColumn.implicitHeight, Style.space(520))
+          contentWidth: width
+          contentHeight: sessionsColumn.implicitHeight
+          boundsBehavior: Flickable.StopAtBounds
+          clip: true
+
+          Column {
+            id: sessionsColumn
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.externalSessions
+
+              Rectangle {
+                id: sessRow
+                required property var modelData
+                required property int index
+                readonly property bool isSelected: index === root.sessionIndex
+                width: sessionsColumn.width
+                radius: Style.cornerRadius
+                color: isSelected || sessMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : Style.normalFillFor(root.foreground, root.accent)
+                border.width: isSelected ? Math.max(1, Style.space(2)) : Style.spacing.hairline
+                border.color: isSelected ? root.accent : Style.normalBorderFor(root.foreground, root.accent)
+                implicitHeight: sessColumn.implicitHeight + Style.space(16)
+
+                MouseArea {
+                  id: sessMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: { root.sessionIndex = sessRow.index; root.openSession() }
+                }
+
+                Row {
+                  id: sessColumn
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: sessRow.modelData.attached ? String.fromCodePoint(0xF03D9) : String.fromCodePoint(0xF0209)
+                    color: sessRow.modelData.attached ? root.accent : root.faint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: sessRow.modelData.name
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: sessRow.modelData.attached
+                    elide: Text.ElideRight
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: sessRow.modelData.windows + (sessRow.modelData.windows === 1 ? " window" : " windows")
+                      + (sessRow.modelData.attached ? " · attached" : "")
+                    color: root.faint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.view === "sessions" && root.externalSessions.length === 0
+          width: parent.width
+          topPadding: Style.space(8)
+          bottomPadding: Style.space(8)
+          textFormat: Text.PlainText
+          text: "No external tmux sessions. Hermes will create them when it delegates work to Claude Code."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          wrapMode: Text.Wrap
         }
 
         // ------------------------------------------------------ settings --
@@ -1557,10 +1682,12 @@ Panel {
             ? (root.formFocus === 5
                ? "Type a path  ·  ↓↑ pick a folder  ·  Enter or → open it  ·  Alt+↑ up a level  ·  Enter (nothing picked) or Ctrl+Enter start  ·  Esc back"
                : "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back")
+            : root.view === "sessions"
+              ? "Enter open  ·  Esc back"
             : root.view === "settings"
               ? "↑↓ pick  ·  Enter or Space toggle / edit  ·  Enter saves the folder  ·  Esc back"
-              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear done  ·  s settings  ·  Esc close"
-                                       : "n new  ·  s settings  ·  Esc close")
+              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear done  ·  v sessions  ·  s settings  ·  Esc close"
+                                       : "n new  ·  v sessions  ·  s settings  ·  Esc close")
           color: root.faint
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

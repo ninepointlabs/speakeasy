@@ -26,6 +26,10 @@ name, with the ones that need you on top.
 - **Named tasks.** "Fix the login redirect loop", not "terminal 4".
 - **Hidden terminals.** Each task is a tmux session on a private socket. No
   window appears until you ask for one; closing the window only hides it.
+- **See external sessions.** Press `v` for a Sessions view listing tmux
+  sessions on your regular socket (the ones Hermes creates when it hands
+  work to Claude Code, say), so you can open and watch them too — even
+  though Speakeasy did not start them.
 - **Knows when it needs you.**
   - Claude Code reports through hooks: an approval prompt says what it wants
     to do ("Wants to run: npm test"), and a finished turn shows the first line
@@ -152,6 +156,7 @@ first line of the answer.
 | `x` | Stop a running task, or remove an ended one; press `x`, `Enter` or `y` again to confirm |
 | `c` | Clear completed tasks (done, ended or stopped) that you have checked. A task you haven't opened or peeked at yet keeps its ● and stays |
 | `Shift+C` | Clear every completed task, checked or not, after a confirmation |
+| `v` | Sessions: external tmux sessions (not started by Speakeasy), to open and watch |
 | `s` | Settings |
 | `Esc` | Cancel a confirmation, close the peek, then close the panel |
 
@@ -250,6 +255,7 @@ speakeasy new -a codex -t "From a file" --prompt=- < task.md   # description fro
 speakeasy list                                # attention first; * marks results you have not seen
 speakeasy open login                          # by id, id prefix, or part of the title
 speakeasy open next                           # the task that most needs you
+speakeasy open --external my-session          # a tmux session on your regular socket, not a Speakeasy task
 speakeasy peek login -n 20                    # last lines of its screen
 speakeasy send login "yes, go ahead"          # type a line into it and press Enter
 speakeasy rename login "Fix the login loop"
