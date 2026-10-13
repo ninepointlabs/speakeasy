@@ -483,13 +483,13 @@ class Mcp(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
 class EndToEnd(unittest.TestCase):
-    def run_cli(self, *args):
+    def run_cli(self, *args, stdin=None):
         env = dict(os.environ, PATH=os.environ["PATH"])
         # The subprocess must use the same private socket as this test.
         code = "import importlib.machinery,sys;" \
                f"m=importlib.machinery.SourceFileLoader('se',{CLI!r}).load_module();" \
                f"m.SOCKET={se.SOCKET!r};sys.argv=['speakeasy']+{list(args)!r};m.main()"
-        return subprocess.run([sys.executable, "-c", code], text=True, capture_output=True, env=env)
+        return subprocess.run([sys.executable, "-c", code], text=True, capture_output=True, env=env, input=stdin)
 
     def tearDown(self):
         subprocess.run(["tmux", "-L", se.SOCKET, "kill-server"], capture_output=True)
@@ -544,6 +544,20 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(prefs["recentCwds"][0], os.path.join(root, "app"))
         listed, _ = mcp_call("list_tasks")
         self.assertIn(out["id"], [t["id"] for t in listed["tasks"]])
+
+    def test_panel_sends_title_and_prompt_on_stdin(self):
+        payload = json.dumps({"title": "-Secret title", "prompt": "secret\nprompt"}) + "\n"
+        r = self.run_cli("new", "--json", "--stdin-json", "--agent=fake", f"--cwd={TMP}", stdin=payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        t = json.loads(r.stdout)
+        self.assertEqual((t["title"], t["prompt"]), ("-Secret title", "secret\nprompt"))
+        r = self.run_cli("new", "--stdin-json", "--agent=fake", stdin="not json\n")
+        self.assertIn("one line of JSON", r.stderr)
+        # The panel's own command line carries neither.
+        with open(os.path.join(ROOT, "Panel.qml")) as f:
+            qml = f.read()
+        self.assertNotIn('"--title=" + title', qml)
+        self.assertNotIn('"--prompt=" + prompt', qml)
 
 if __name__ == "__main__":
     unittest.main()

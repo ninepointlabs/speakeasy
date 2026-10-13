@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SOCKET = "speakeasy"
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "speakeasy")
@@ -654,10 +654,20 @@ def cmd_new(a):
     cfg = config()
     if a.interactive:
         interactive_new(a, cfg)
+    if a.stdin_json:
+        # The panel sends {"title", "prompt"} as one line on stdin, so its
+        # text never appears in this process's arguments.
+        try:
+            text = json.loads(sys.stdin.readline() or "{}")
+        except ValueError:
+            die("--stdin-json expects one line of JSON")
+        if not isinstance(text, dict):
+            die("--stdin-json expects a JSON object")
+        a.title, a.prompt = str(text.get("title") or ""), str(text.get("prompt") or "")
     if not a.title and not a.prompt:
         die("give the task a --title or a --prompt (or use -i)")
     prompt = a.prompt
-    if prompt == "-":
+    if prompt == "-" and not a.stdin_json:
         prompt = sys.stdin.read()
     try:
         task = start_task(cfg, a.agent, a.model, a.effort, a.title, prompt, a.cwd, a.extra)
@@ -1621,6 +1631,8 @@ def main(argv=None):
     s.add_argument("-C", "--cwd", default="")
     s.add_argument("-i", "--interactive", action="store_true", help="ask for everything")
     s.add_argument("-o", "--open", action="store_true", help="also open its terminal now")
+    s.add_argument("--stdin-json", action="store_true",
+                   help='read {"title": ..., "prompt": ...} as one line of JSON on stdin')
     s.add_argument("--json", action="store_true")
     s.add_argument("extra", nargs="*", help="extra agent arguments, after --")
     s.set_defaults(fn=cmd_new)

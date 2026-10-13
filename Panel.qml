@@ -400,19 +400,24 @@ Panel {
     if (title === "" && prompt === "") { error = "Give the task a title or a description."; setFormFocus(3); return }
     error = ""
     starting = true
-    // "--flag=value" so a title or description starting with "-" stays text.
-    var args = ["new", "--json", "--agent=" + currentAgent.id, "--title=" + title, "--prompt=" + prompt]
+    // The title and description go over stdin (newProc), never in argv,
+    // where other users could read them. "--flag=value" keeps the rest text.
+    var args = ["new", "--json", "--stdin-json", "--agent=" + currentAgent.id]
     if (currentModel !== "") args.push("--model=" + currentModel)
     if (effort !== "") args.push("--effort=" + effort)
     if (folderField.text.trim() !== "") args.push("--cwd=" + folderField.text.trim())
-    run(args, function(code, out, err) {
-      root.starting = false
-      if (code !== 0) { root.error = (err || "Could not start the task.").replace(/^speakeasy: /, ""); return }
-      var id = ""
-      try { id = JSON.parse(out).id } catch (e) {}
-      root.pendingSelectId = id
-      root.showList()
-    })
+    newProc.payload = JSON.stringify({ title: title, prompt: prompt })
+    newProc.command = [cli].concat(args)
+    newProc.running = true
+  }
+  function started(code, out, err) {
+    starting = false
+    if (code !== 0) { error = (err || "Could not start the task.").replace(/^speakeasy: /, ""); return }
+    var id = ""
+    try { id = JSON.parse(out).id } catch (e) {}
+    pendingSelectId = id
+    showList()
+    refresh()
   }
   property string pendingSelectId: ""
   onTasksChanged: {
@@ -680,6 +685,22 @@ Panel {
       else if (code !== 0) root.error = actionErr.text.trim().replace(/^speakeasy: /, "")
       root.refresh()
     }
+  }
+
+  // Starts a task; the title and description are written to its stdin.
+  Process {
+    id: newProc
+    environment: root.procEnv
+    property string payload: ""
+    running: false
+    stdinEnabled: true
+    stdout: StdioCollector { id: newOut }
+    stderr: StdioCollector { id: newErr }
+    onStarted: {
+      write(payload + "\n")
+      payload = ""
+    }
+    onExited: function(code) { root.started(code, newOut.text, newErr.text.trim()) }
   }
 
   Process {
