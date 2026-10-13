@@ -385,6 +385,102 @@ class State(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["prefs"]["cwd"], os.path.expanduser("~"))
 
 
+def mcp_call(name, args=None, client="Grok Bot"):
+    reply = se.mcp_handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": name, "arguments": args or {}}}, {"client": client})
+    result = reply["result"]
+    return json.loads(result["content"][0]["text"]), result["isError"]
+
+
+def make_repo(path, url):
+    os.makedirs(os.path.join(path, ".git"), exist_ok=True)
+    with open(os.path.join(path, ".git", "config"), "w") as f:
+        f.write(f'[remote "origin"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n')
+
+
+class Mcp(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(dir=TMP)
+        self.cfg_path = os.path.join(TMP, "config", "speakeasy", "config.json")
+        with open(self.cfg_path) as f:
+            self.saved = f.read()
+        cfg = json.loads(self.saved)
+        cfg["repoRoots"] = [self.root]
+        with open(self.cfg_path, "w") as f:
+            json.dump(cfg, f)
+
+    def tearDown(self):
+        with open(self.cfg_path, "w") as f:
+            f.write(self.saved)
+
+    def test_stdio_handshake_and_tools(self):
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": "2025-03-26", "clientInfo": {"name": "Grok Bot"}, "capabilities": {}}},
+                 {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                 {"jsonrpc": "2.0", "id": 3, "method": "nope"}]
+        r = subprocess.run([sys.executable, CLI, "mcp"], input="\n".join(json.dumps(x) for x in lines) + "\nnot json\n",
+                           text=True, capture_output=True, timeout=30)
+        replies = [json.loads(x) for x in r.stdout.splitlines()]
+        self.assertEqual([x["id"] for x in replies], [1, 2, 3, None])
+        self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-03-26")
+        self.assertEqual({t["name"] for t in replies[1]["result"]["tools"]},
+                         {"list_agents", "find_repo", "create_task", "list_tasks"})
+        self.assertEqual(replies[2]["error"]["code"], -32601)
+        self.assertEqual(replies[3]["error"]["code"], -32700)
+
+    def test_create_task_takes_no_agent_arguments(self):
+        schema = next(t for t in se.MCP_TOOLS if t["name"] == "create_task")["inputSchema"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertNotIn("args", schema["properties"])
+
+    def test_repo_slugs(self):
+        for url in ("https://github.com/Owner/Repo.git", "git@github.com:owner/repo.git",
+                    "ssh://git@github.com/owner/repo", "owner/repo", "https://u:tok@github.com/owner/repo/"):
+            self.assertEqual(se.repo_slug(url), "owner/repo", url)
+        self.assertEqual(se.repo_slug("repo"), "repo")
+
+    def test_find_repo_by_remote_or_name_and_hides_credentials(self):
+        make_repo(os.path.join(self.root, "app"), "https://x-access-token:SECRET@github.com/acme/app.git")
+        make_repo(os.path.join(self.root, "work", "site"), "git@github.com:acme/website.git")
+        os.makedirs(os.path.join(self.root, "plain"))
+        found, err = mcp_call("find_repo", {"repo": "https://github.com/acme/app"})
+        self.assertFalse(err)
+        self.assertEqual([m["path"] for m in found["matches"]], [os.path.join(self.root, "app")])
+        self.assertNotIn("SECRET", json.dumps(found))
+        found, _ = mcp_call("find_repo", {"repo": "acme/website"})
+        self.assertEqual([m["path"] for m in found["matches"]], [os.path.join(self.root, "work", "site")])
+        found, _ = mcp_call("find_repo", {"repo": "website"})
+        self.assertEqual(len(found["matches"]), 1)
+        found, _ = mcp_call("find_repo", {"repo": "other/app"})
+        self.assertEqual(found["matches"], [])
+
+    def test_create_task_refuses_bad_choices(self):
+        base = {"title": "Fix CI", "description": "CI is red", "agent": "fake"}
+        out, err = mcp_call("create_task", dict(base, model="huge"))
+        self.assertTrue(err)
+        self.assertIn("does not list model", out["error"])
+        out, err = mcp_call("create_task", dict(base, repo="acme/missing"))
+        self.assertTrue(err)
+        self.assertIn("not checked out", out["error"])
+        make_repo(os.path.join(self.root, "a"), "git@github.com:acme/dup.git")
+        make_repo(os.path.join(self.root, "b"), "git@github.com:acme/dup.git")
+        out, err = mcp_call("create_task", dict(base, repo="acme/dup"))
+        self.assertIn("several places", out["error"])
+        out, err = mcp_call("create_task", dict(base, description=""))
+        self.assertIn("required", out["error"])
+        out, err = mcp_call("create_task", dict(base, agent="nope"))
+        self.assertIn("unknown agent", out["error"])
+        se.main(["agents", "--hide", "fake"])
+        try:
+            out, err = mcp_call("create_task", base)
+            self.assertIn("hidden", out["error"])
+            agents, _ = mcp_call("list_agents")
+            self.assertNotIn("fake", [a["id"] for a in agents["agents"]])
+        finally:
+            se.main(["agents", "--show", "fake"])
+
+
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
 class EndToEnd(unittest.TestCase):
     def run_cli(self, *args):
@@ -422,6 +518,32 @@ class EndToEnd(unittest.TestCase):
         r = self.run_cli("new", "-a", "fake", "-t", "x", "-e", "high", "-C", TMP)
         self.assertIn("does not take effort", r.stderr)
 
+
+    def test_mcp_task_starts_in_repo_and_keeps_picker_choices(self):
+        root = tempfile.mkdtemp(dir=TMP)
+        make_repo(os.path.join(root, "app"), "https://github.com/acme/e2e-app.git")
+        cfg_path = os.path.join(TMP, "config", "speakeasy", "config.json")
+        with open(cfg_path) as f:
+            saved = f.read()
+        with open(cfg_path, "w") as f:
+            json.dump(dict(json.loads(saved), repoRoots=[root]), f)
+        se.write_json(se.PREFS_PATH, {"agent": "claude", "model": "opus", "effort": "high", "cwd": TMP})
+        try:
+            out, err = mcp_call("create_task", {"title": "Fix CI", "description": "CI is red on main",
+                                                "agent": "fake", "model": "big", "repo": "acme/e2e-app"})
+        finally:
+            with open(cfg_path, "w") as f:
+                f.write(saved)
+        self.assertFalse(err, out)
+        task = se.load_task(out["id"])
+        self.assertEqual(task["cwd"], os.path.join(root, "app"))
+        self.assertEqual(task["origin"], "Grok Bot")
+        self.assertEqual((task["model"], task["args"]), ("big", []))
+        prefs = se.load_json(se.PREFS_PATH, {})
+        self.assertEqual((prefs["agent"], prefs["model"], prefs["cwd"]), ("claude", "opus", TMP))
+        self.assertEqual(prefs["recentCwds"][0], os.path.join(root, "app"))
+        listed, _ = mcp_call("list_tasks")
+        self.assertIn(out["id"], [t["id"] for t in listed["tasks"]])
 
 if __name__ == "__main__":
     unittest.main()

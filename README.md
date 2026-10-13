@@ -40,6 +40,11 @@ name, with the ones that need you on top.
     recognised and flagged instead of sitting unnoticed.
 - **Notifications that open the right terminal.** Click one and that task's
   terminal opens, or comes to the front if it is already open.
+- **Other programs can hand you tasks.** `speakeasy mcp` is an MCP server:
+  a bot watching your GitHub repos (Grok Bot, Hermes, Claude Code) can pick
+  the agent, model and effort, write the title and description, and start
+  the task in the repo's local checkout. It shows up in your list like any
+  other task.
 - **Peek without opening.** See the last lines of a task's screen right in the
   panel.
 - **Every model on offer.** Claude Code's aliases and pinned versions, the
@@ -268,12 +273,43 @@ speakeasy agents --hide crush --show codex    # choose what the new-task picker 
 speakeasy set notify off                      # also: default-cwd PATH, quiet-seconds N, terminal CMD
 speakeasy models [agent] [--refresh]          # which models each offers
 speakeasy ui [new]                            # the panel, or a terminal without Omarchy
+speakeasy mcp                                 # MCP server on stdio, for other programs (below)
 ```
 
 `speakeasy new` prints the new task's id; add `--json` for the whole record,
 or `-o` to open its terminal straight away. Arguments after `--` go to the
 agent itself, e.g. `speakeasy new -a claude -t Review -p "…" -- --permission-mode plan`.
 Use `--prompt=…` (with `=`) for a description that starts with `-`.
+
+### From another program (MCP)
+
+`speakeasy mcp` speaks the Model Context Protocol over stdio (standard
+library only, like the rest). Add it to any MCP client as a local command:
+
+```json
+{ "mcpServers": { "speakeasy": { "command": "/home/you/.local/bin/speakeasy", "args": ["mcp"] } } }
+```
+
+For Claude Code: `claude mcp add speakeasy -- ~/.local/bin/speakeasy mcp`.
+
+| Tool | Does |
+|---|---|
+| `list_agents` | Installed, visible agents with each model's label and effort levels |
+| `find_repo` | Where a repo is checked out, by GitHub URL, `owner/name` or name |
+| `create_task` | Start a task: `title`, `description`, `agent`, and optionally `model`, `effort`, and `repo` or `cwd` |
+| `list_tasks` | Tasks and their status, so a bot can avoid starting a duplicate |
+
+`find_repo` (and `create_task` with `repo`) looks at the git remotes of the
+checkouts in your default folder and `~/Projects`, one or two levels down,
+plus every folder a task has used; set `repoRoots` to look elsewhere. A repo
+that is not on disk, or is checked out twice, is refused with a message
+saying so, rather than started in the wrong folder.
+
+A task started this way records the client's name as its `origin`, and does
+not change the agent, model or folder the new-task form remembers for you.
+The MCP client cannot pass extra agent arguments (so it cannot turn off
+permission prompts), cannot see a task's screen, type into it or stop it:
+approvals and answers stay with you.
 
 ### Other desktops
 
@@ -313,7 +349,8 @@ Optional, in `~/.config/speakeasy/config.json`:
 | `quietSeconds` | How long a watched agent's screen must be still before it counts as done or waiting |
 | `notify` | `false` turns notifications off |
 | `agents` | Override a built-in agent (any field) or add your own |
-| `hiddenAgents` | Agent ids left out of the new-task picker (Settings changes this) |
+| `hiddenAgents` | Agent ids left out of the new-task picker (Settings changes this); MCP clients cannot use them either |
+| `repoRoots` | Folders `find_repo` searches for git checkouts. Default: `defaultCwd` and `~/Projects` |
 
 An agent entry takes `name`, `bin`, `models` (`""` is the agent's default),
 `modelLabels`, `modelFlag` (passed as `<flag>=<model>`), and `prompt`: `keys`
@@ -361,6 +398,11 @@ users on the machine can see it; every built-in agent uses `keys`.
 - Model names read from other programs (`agy models`, Codex's cache) must look
   like model names or they are ignored. Task ids must be six hex digits before
   they are used in a file path.
+- `speakeasy mcp` only talks over its own stdin and stdout; it opens no
+  network port. Whatever runs it can start tasks with any installed, visible
+  agent in any folder you can read, so add it only to clients you trust.
+  `find_repo` strips credentials (`https://user:token@…`) from the remote URLs
+  it reports.
 - The hooks Speakeasy gives Claude Code only record state and send
   notifications. They never approve anything; approvals are always yours.
 - Task records hold the title, description, folder and last status line. They

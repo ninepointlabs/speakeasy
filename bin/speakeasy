@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 SOCKET = "speakeasy"
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "speakeasy")
@@ -646,66 +646,90 @@ def claude_hooks(tid):
                       ("SessionStart", "UserPromptSubmit", "PostToolUse", "PermissionRequest", "Notification", "Stop")}}
 
 
+class TaskError(Exception):
+    pass
+
+
 def cmd_new(a):
     cfg = config()
     if a.interactive:
         interactive_new(a, cfg)
     if not a.title and not a.prompt:
         die("give the task a --title or a --prompt (or use -i)")
-    agent = agent_by_id(a.agent or "")
-    if agent is None:
-        die(f"unknown agent {a.agent!r}; see `speakeasy agents`")
-    if not agent["installed"]:
-        die(f"{agent['name']} ({agent['bin']}) is not installed")
-    if not shutil.which("tmux"):
-        die("tmux is required")
-    cwd = os.path.abspath(os.path.expanduser(a.cwd or cfg.get("defaultCwd") or "~"))
-    if not os.path.isdir(cwd):
-        die(f"folder does not exist: {cwd}")
-    effort = a.effort or ""
-    if effort and effort not in efforts_for(agent, a.model or ""):
-        allowed = ", ".join(efforts_for(agent, a.model or "")) or "none"
-        die(f"{agent['name']} {a.model or 'default'} does not take effort {effort!r} (allowed: {allowed})")
     prompt = a.prompt
     if prompt == "-":
         prompt = sys.stdin.read()
+    try:
+        task = start_task(cfg, a.agent, a.model, a.effort, a.title, prompt, a.cwd, a.extra)
+    except TaskError as e:
+        die(str(e))
+    if a.json:
+        print(json.dumps(task))
+    else:
+        print(f"{task['id']}  {task['title']}  ({task_label(task)}, {task['cwd']})")
+    if a.open:
+        open_task(task)
+
+
+def task_label(task, agent=None):
+    agent = agent or agent_by_id(task["agent"]) or {"name": task["agent"], "modelLabels": {}}
+    return " · ".join(x for x in (agent["name"], agent["modelLabels"].get(task["model"], task["model"]),
+                                  task.get("effort")) if x)
+
+
+def start_task(cfg, agent_id, model, effort, title, prompt, cwd, extra=None, origin="", remember=True):
+    """Create a task and start its hidden terminal; returns the task record.
+    `remember` saves agent, model, effort and folder as the picker's next
+    defaults; tasks started by other programs (MCP) only add to recent folders."""
+    agent = agent_by_id(agent_id or "")
+    if agent is None:
+        raise TaskError(f"unknown agent {agent_id!r}; see `speakeasy agents`")
+    if not agent["installed"]:
+        raise TaskError(f"{agent['name']} ({agent['bin']}) is not installed")
+    if not shutil.which("tmux"):
+        raise TaskError("tmux is required")
+    cwd = os.path.abspath(os.path.expanduser(cwd or cfg.get("defaultCwd") or "~"))
+    if not os.path.isdir(cwd):
+        raise TaskError(f"folder does not exist: {cwd}")
+    model = model or ""
+    effort = effort or ""
+    if effort and effort not in efforts_for(agent, model):
+        allowed = ", ".join(efforts_for(agent, model)) or "none"
+        raise TaskError(f"{agent['name']} {model or 'default'} does not take effort {effort!r} (allowed: {allowed})")
     prompt = (prompt or "").strip()
-    title = (a.title or prompt.splitlines()[0][:60]).strip()
+    title = (title or prompt.splitlines()[0][:60]).strip()
 
     tid = secrets.token_hex(3)
     while os.path.exists(task_path(tid)):
         tid = secrets.token_hex(3)
     task = {
         "id": tid, "title": title, "prompt": prompt, "agent": agent["id"], "agentName": agent["name"],
-        "model": a.model or "", "effort": effort, "cwd": cwd, "args": a.extra or [], "status": "starting",
+        "model": model, "effort": effort, "cwd": cwd, "args": extra or [], "status": "starting",
         "detail": "", "unseen": False, "createdAt": now(), "updatedAt": now(),
         "exitCode": None, "sessionId": "",
     }
+    if origin:
+        task["origin"] = origin
     private_dir(TASKS_DIR)
     write_json(task_path(tid), task)
     old = load_json(PREFS_PATH, {})
     recent = [cwd] + [d for d in old.get("recentCwds") or [] if d != cwd]
-    write_json(PREFS_PATH, {"agent": agent["id"], "model": task["model"], "effort": effort, "cwd": cwd,
-                            "recentCwds": recent[:10]})
+    prefs = {"agent": agent["id"], "model": model, "effort": effort, "cwd": cwd} if remember else \
+        {k: old[k] for k in ("agent", "model", "effort", "cwd") if k in old}
+    write_json(PREFS_PATH, dict(prefs, recentCwds=recent[:10]))
 
     write_tmux_conf()
-    label = " · ".join(x for x in (agent["name"], agent["modelLabels"].get(task["model"], task["model"]),
-                                    effort) if x)
+    label = task_label(task, agent)
     r = tmux("new-session", "-d", "-s", session(tid), "-c", cwd, "-x", "200", "-y", "50",
              "-e", f"SPEAKEASY_TASK={tid}",
              shlex.join([sys.executable, SELF, "_run", tid]))
     if r.returncode != 0:
         update_task(tid, status="exited", detail="tmux failed: " + r.stderr.strip())
-        die("tmux failed to start the task: " + r.stderr.strip())
+        raise TaskError("tmux failed to start the task: " + r.stderr.strip())
     tmux("set-option", "-t", session(tid), "@se_title", title.replace("#", "##"))
     tmux("set-option", "-t", session(tid), "@se_agent", label.replace("#", "##"))
     bump_rev()
-    if a.json:
-        print(json.dumps(load_task(tid)))
-    else:
-        print(f"{tid}  {title}  ({label}, {cwd})")
-    if a.open:
-        open_task(load_task(tid))
+    return load_task(tid)
 
 
 def interactive_new(a, cfg):
@@ -1327,6 +1351,260 @@ def cmd_ui(a):
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ------------------------------------------------------------------ repos --
+
+def git_remotes(path):
+    """Remote URLs from a checkout's .git/config, read without running git."""
+    urls = []
+    try:
+        with open(os.path.join(path, ".git", "config")) as f:
+            for line in f:
+                key, sep, value = line.partition("=")
+                if sep and key.strip() == "url":
+                    # Drop any user:token@ so credentials never leave this machine.
+                    urls.append(re.sub(r"^([a-z+]+://)[^/@]*@", r"\1", value.strip()))
+    except OSError:
+        pass
+    return urls
+
+
+def repo_slug(text):
+    """'owner/name' from a GitHub-style URL, SSH remote or 'owner/name';
+    just 'name' when there is no owner. Lowercase, without '.git'."""
+    text = text.strip().lower().rstrip("/")
+    text = re.sub(r"\.git$", "", text)
+    text = re.sub(r"^[a-z+]+://([^/@]+@)?", "", text)  # https://, ssh://git@
+    text = re.sub(r"^[^/@:]+@", "", text)               # git@
+    text = text.replace(":", "/")
+    parts = [p for p in text.split("/") if p]
+    if len(parts) >= 3 and "." in parts[0]:
+        parts = parts[1:]                                # drop the host
+    return "/".join(parts[-2:])
+
+
+def repo_roots(cfg):
+    roots = cfg.get("repoRoots") or [cfg.get("defaultCwd") or "~", "~/Projects"]
+    out = []
+    for r in roots:
+        r = os.path.abspath(os.path.expanduser(str(r)))
+        if os.path.isdir(r) and r not in out:
+            out.append(r)
+    return out
+
+
+def local_repos(cfg):
+    """Git checkouts on disk: in the repo roots and one level below, plus
+    every folder a task has used."""
+    found = []
+
+    def add(path):
+        if path not in found and os.path.exists(os.path.join(path, ".git")):
+            found.append(path)
+            return True
+        return False
+
+    for root in repo_roots(cfg):
+        if add(root):
+            continue
+        for depth in (1, 2):
+            pattern = os.path.join(root, *(["[!.]*"] * depth))
+            for d in sorted(glob.glob(pattern)):
+                if os.path.isdir(d) and (depth == 1 or not os.path.exists(os.path.join(os.path.dirname(d), ".git"))):
+                    add(d)
+    recent = load_json(PREFS_PATH, {}).get("recentCwds") or []
+    for d in recent + [t.get("cwd") for t in all_tasks()]:
+        if isinstance(d, str) and os.path.isdir(d):
+            add(d)
+    return found
+
+
+def find_repos(cfg, query):
+    """Local checkouts of a repository named by URL, 'owner/name' or 'name'."""
+    want = repo_slug(query)
+    if not want:
+        return []
+    hits = []
+    for path in local_repos(cfg):
+        remotes = git_remotes(path)
+        slugs = [repo_slug(u) for u in remotes]
+        if "/" in want:
+            match = want in slugs
+        else:
+            match = want in [s.split("/")[-1] for s in slugs] or os.path.basename(path).lower() == want
+        if match:
+            hits.append({"path": path, "remotes": remotes})
+    return hits
+
+
+# -------------------------------------------------------------------- mcp --
+
+# Other programs (Grok Bot, Hermes, Claude Code...) start and list tasks
+# through MCP over stdio: JSON-RPC 2.0, one message per line, standard
+# library only. They can start a task with an agent, model, effort, title,
+# description and folder, and see how tasks are doing. They cannot pass
+# extra agent arguments (no skipping permission prompts), read a task's
+# screen, type into it, or stop it: approvals and answers stay yours.
+
+MCP_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+MCP_TOOLS = [
+    {"name": "list_agents",
+     "description": "The coding agents installed for Speakeasy, with the models and effort levels each accepts. "
+                    "Call this before create_task to pick a valid agent, model and effort.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "find_repo",
+     "description": "Find where a repository is checked out on this computer, by GitHub URL, 'owner/name' "
+                    "or just the name. Matches the checkouts' git remotes (and folder names for a bare name). "
+                    "Returns no matches if it is not on disk.",
+     "inputSchema": {"type": "object", "properties": {
+         "repo": {"type": "string", "description": "e.g. 'ninepointlabs/speakeasy' or 'https://github.com/ninepointlabs/speakeasy'"}},
+         "required": ["repo"], "additionalProperties": False},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "create_task",
+     "description": "Start a coding agent on a task in a hidden terminal that the user monitors in Speakeasy. "
+                    "The description is typed into the agent as its first prompt, so write it as the full "
+                    "instructions. The agent asks the user before risky actions; you cannot answer for them. "
+                    "Give `repo` to start in that repository's local checkout, or `cwd` for a folder; "
+                    "with neither, the user's default folder is used.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Short name shown in the task list and notifications, e.g. 'Fix failing CI on main'."},
+         "description": {"type": "string", "description": "The full task for the agent: what to do, context, links, how to verify."},
+         "agent": {"type": "string", "description": "Agent id from list_agents, e.g. 'claude' or 'codex'."},
+         "model": {"type": "string", "description": "A model id from list_agents for that agent; omit or '' for the agent's default."},
+         "effort": {"type": "string", "description": "An effort level the agent and model accept (see list_agents); omit for the default."},
+         "repo": {"type": "string", "description": "Repository to work in: GitHub URL, 'owner/name' or name. Must be checked out locally (see find_repo)."},
+         "cwd": {"type": "string", "description": "Folder to work in (absolute or ~/...). Takes precedence over repo."}},
+         "required": ["title", "description", "agent"], "additionalProperties": False},
+     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}},
+    {"name": "list_tasks",
+     "description": "Speakeasy's tasks, the ones needing the user first: id, title, status (needs-you, ready, running, "
+                    "starting, exited, stopped), the latest detail, agent, model, folder, and who started it "
+                    "(origin). Use it to avoid starting a duplicate.",
+     "inputSchema": {"type": "object", "properties": {
+         "active_only": {"type": "boolean", "description": "Only tasks whose terminal is still running."}},
+         "additionalProperties": False},
+     "annotations": {"readOnlyHint": True}},
+]
+
+
+def mcp_list_agents(args, client):
+    cfg = config()
+    items = [x for x in agents(cfg) if x["installed"] and not x["hidden"]]
+    refresh_stale_models(items)
+    out = []
+    for x in items:
+        out.append({"id": x["id"], "name": x["name"],
+                    "models": [{"id": m, "label": x["modelLabels"].get(m) or m or "Default",
+                                "efforts": efforts_for(x, m)} for m in x["models"]]})
+    return {"agents": out, "defaultFolder": default_cwd(cfg)}
+
+
+def mcp_find_repo(args, client):
+    return {"matches": find_repos(config(), str(args.get("repo") or ""))}
+
+
+def mcp_create_task(args, client):
+    cfg = config()
+    title = str(args.get("title") or "").strip()
+    prompt = str(args.get("description") or "").strip()
+    if not title or not prompt:
+        raise TaskError("title and description are both required")
+    aid = str(args.get("agent") or "")
+    agent = agent_by_id(aid)
+    if agent is not None and agent["hidden"]:
+        raise TaskError(f"{agent['name']} is hidden in Speakeasy's settings; pick another agent from list_agents")
+    model = str(args.get("model") or "")
+    if agent is not None and model not in agent["models"]:
+        raise TaskError(f"{agent['name']} does not list model {model!r}; choose one of: "
+                        + ", ".join(m or "'' (default)" for m in agent["models"]))
+    cwd = str(args.get("cwd") or "")
+    if not cwd and args.get("repo"):
+        hits = find_repos(cfg, str(args["repo"]))
+        if not hits:
+            raise TaskError(f"{args['repo']!r} is not checked out on this computer; give `cwd`, "
+                            "or leave out both to use the default folder")
+        if len(hits) > 1:
+            raise TaskError(f"{args['repo']!r} is checked out in several places; give `cwd` as one of: "
+                            + ", ".join(h["path"] for h in hits))
+        cwd = hits[0]["path"]
+    task = start_task(cfg, aid, model, str(args.get("effort") or ""), title, prompt, cwd,
+                      origin=client or "mcp", remember=False)
+    return {"id": task["id"], "title": task["title"], "status": task["status"], "cwd": task["cwd"],
+            "agent": task_label(task, agent)}
+
+
+def mcp_list_tasks(args, client):
+    tasks = sorted(reconcile(all_tasks()), key=sort_key)
+    if args.get("active_only"):
+        tasks = [t for t in tasks if t.get("status") in LIVE]
+    keys = ("id", "title", "status", "detail", "agent", "model", "effort", "cwd", "origin", "createdAt", "updatedAt")
+    return {"tasks": [{k: t.get(k, "") for k in keys} for t in tasks]}
+
+
+MCP_HANDLERS = {"list_agents": mcp_list_agents, "find_repo": mcp_find_repo,
+                "create_task": mcp_create_task, "list_tasks": mcp_list_tasks}
+
+
+def mcp_handle(msg, state):
+    """One JSON-RPC message in; the response (or None for a notification) out."""
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+        return {"jsonrpc": "2.0", "id": msg.get("id") if isinstance(msg, dict) else None,
+                "error": {"code": -32600, "message": "invalid request"}}
+    method, mid, params = msg["method"], msg.get("id"), msg.get("params") or {}
+    if "id" not in msg:
+        return None  # notifications/initialized and friends need no answer
+
+    def ok(result):
+        return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        state["client"] = str((params.get("clientInfo") or {}).get("name") or "")[:60]
+        return ok({"protocolVersion": asked if asked in MCP_VERSIONS else MCP_VERSIONS[0],
+                   "capabilities": {"tools": {}},
+                   "serverInfo": {"name": "speakeasy", "version": VERSION},
+                   "instructions": "Start coding-agent tasks the user watches in Speakeasy. Call list_agents "
+                                   "first, check list_tasks to avoid duplicates, then create_task."})
+    if method == "ping":
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": MCP_TOOLS})
+    if method == "tools/call":
+        fn = MCP_HANDLERS.get(params.get("name"))
+        if fn is None:
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"unknown tool {params.get('name')!r}"}}
+        args = params.get("arguments") or {}
+        try:
+            result, failed = fn(args if isinstance(args, dict) else {}, state.get("client", "")), False
+        except TaskError as e:
+            result, failed = {"error": str(e)}, True
+        except SystemExit:
+            result, failed = {"error": "speakeasy refused the request (see its stderr)"}, True
+        return ok({"content": [{"type": "text", "text": json.dumps(result, indent=1)}], "isError": failed})
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown method {method!r}"}}
+
+
+def cmd_mcp(a):
+    """MCP server on stdin/stdout. Anything else that prints (a helper, a
+    warning) goes to stderr so it cannot corrupt the protocol."""
+    out = sys.stdout
+    sys.stdout = sys.stderr
+    state = {}
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+        else:
+            reply = mcp_handle(msg, state)
+        if reply is not None:
+            out.write(json.dumps(reply) + "\n")
+            out.flush()
+
+
 # ------------------------------------------------------------------- main --
 
 def main(argv=None):
@@ -1416,6 +1694,9 @@ def main(argv=None):
     s = sub.add_parser("ui", help="show the task list or the new-task form (for keybindings)")
     s.add_argument("view", nargs="?", default="list", choices=["list", "new"])
     s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("mcp", help="MCP server on stdio, so other programs can start and list tasks")
+    s.set_defaults(fn=cmd_mcp)
 
     s = sub.add_parser("hook", help=argparse.SUPPRESS)
     s.add_argument("id")
