@@ -92,6 +92,8 @@ BarWidget {
     function toggle(): void { root.togglePanel() }
     function isOpen(): string { return root.anyOpened() || (root.panel && root.panel.centered) ? "true" : "false" }
     // Keybinding entry: a centered window on the focused monitor. "list" toggles, "new" opens the form.
+    // About page: opens the panel (unless the centered window is up) on About.
+    function about(): void { if (!root.panel) return; if (!root.panel.shown) root.open(); root.panel.showAbout() }
     function present(view: string): string { return root.panel ? root.panel.present(view === "new" ? "new" : "list") : "no panel" }
     function status(): string {
       var p = root.openPanel()

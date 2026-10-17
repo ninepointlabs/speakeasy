@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import threading
+import textwrap
 import time
 
 VERSION = "0.3.1"
@@ -40,6 +41,32 @@ CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 TMUX_CONF = os.path.join(STATE_DIR, "tmux.conf")
 SELF = os.path.realpath(__file__)
+
+# For `speakeasy about` and the panel's About page. The license text is the
+# LICENSE file that ships beside bin/.
+ABOUT = {
+    "name": "Speakeasy",
+    "tagline": "AI agents in hidden terminals, one named tab per task.",
+    "organization": "Nine Point Labs",
+    "created": "September 29, 2026",  # first commit
+    "license": "MIT License",
+    "copyright": "Copyright (c) 2026 Nine Point Labs",  # as written in LICENSE
+    "supportEmail": "help@ninepointlabs.com",
+    "source": "github.com/ninepointlabs/speakeasy",
+}
+LICENSE_PATH = os.path.join(os.path.dirname(os.path.dirname(SELF)), "LICENSE")
+PRIVACY = (
+    "Speakeasy has no account and no telemetry, and makes no network connections of its own. "
+    "Your tasks (title, description, folder, agent, status), your last picker choices and cached model lists "
+    "stay in ~/.local/state/speakeasy/ and your settings in ~/.config/speakeasy/config.json, readable only by you. "
+    "Each task's terminal is a tmux session on this machine; Speakeasy keeps no log or transcript of it. It reads "
+    "the screen only when you peek, and Claude Code's own transcript only for its last reply. Hook events are "
+    "logged (to hooks.log in the same folder) only if you set SPEAKEASY_DEBUG. Notifications go to your desktop's "
+    "notification service, and `speakeasy mcp` talks only over stdin and stdout. "
+    "The agents it starts (Claude Code, Codex, Gemini and the others) send your prompts and code to their own "
+    "vendors under those vendors' terms; Speakeasy does not see or control that traffic. Listing models can run "
+    "an agent's own `models` command, which may contact that vendor too."
+)
 
 # Status values, in the order the panel sorts them.
 #   needs-you  the agent is blocked on you: an approval or a question
@@ -1615,6 +1642,43 @@ def cmd_mcp(a):
             out.flush()
 
 
+def about_facts():
+    """What `about` prints; the panel's About page reads it as JSON."""
+    tmux_version = ""
+    if shutil.which("tmux"):
+        try:
+            r = subprocess.run(["tmux", "-V"], text=True, capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+            tmux_version = r.stdout.strip().replace("tmux ", "", 1) if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return dict(ABOUT, version=VERSION, privacy=PRIVACY,
+                licensePath=LICENSE_PATH if os.path.isfile(LICENSE_PATH) else "",
+                python="%d.%d.%d" % sys.version_info[:3], tmux=tmux_version)
+
+
+def cmd_about(a):
+    f = about_facts()
+    if a.json:
+        print(json.dumps(f))
+        return
+    built = ["Python " + f["python"]] + (["tmux " + f["tmux"]] if f["tmux"] else [])
+    where = f["licensePath"] or "the LICENSE file in " + f["source"]
+    print(f"{f['name']} {f['version']}")
+    print(f["tagline"])
+    print()
+    print(f"Made by:    {f['organization']}")
+    print(f"Created:    {f['created']}")
+    print(f"License:    {f['license']}, {f['copyright']}")
+    print(f"            full text: {where}")
+    print(f"Support:    {f['supportEmail']} (please include the first line above)")
+    print(f"Built with: {', '.join(built)}")
+    print(f"Source:     {f['source']}")
+    print()
+    print("Privacy")
+    for line in textwrap.wrap(f["privacy"], 78):
+        print("  " + line)
+
+
 # ------------------------------------------------------------------- main --
 
 def main(argv=None):
@@ -1709,6 +1773,10 @@ def main(argv=None):
 
     s = sub.add_parser("mcp", help="MCP server on stdio, so other programs can start and list tasks")
     s.set_defaults(fn=cmd_mcp)
+
+    s = sub.add_parser("about", help="version, license, support address and privacy")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_about)
 
     s = sub.add_parser("hook", help=argparse.SUPPRESS)
     s.add_argument("id")
