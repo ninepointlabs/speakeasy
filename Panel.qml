@@ -60,6 +60,48 @@ Panel {
   property bool confirmClearAll: false
   property string notice: ""
 
+  // ---------------------------------------------------------- about --
+  // The version comes from manifest.json; the rest from `speakeasy about
+  // --json`, so the CLI and this page state the same facts.
+  property var aboutInfo: ({})
+  property bool showLicense: false
+  property string copiedLabel: ""
+  readonly property string version: {
+    try { return String(JSON.parse(manifestFile.text()).version || "") } catch (e) { return "" }
+  }
+  // Quickshell.hasVersion / hasQtVersion only answer yes or no.
+  function probedVersion(has, major) {
+    if (!has(major, 0)) return ""
+    var minor = 0
+    while (minor < 99 && has(major, minor + 1)) minor++
+    return major + "." + minor
+  }
+  readonly property string quickshellVersion: probedVersion(function(a, b) { return Quickshell.hasVersion(a, b) }, 0)
+  readonly property string qtVersion: probedVersion(function(a, b) { return Quickshell.hasQtVersion(a, b) }, 6)
+  readonly property string builtWith: ["Quickshell " + (quickshellVersion || "?"), "Qt " + (qtVersion || "?"),
+    "Python " + (aboutInfo.python || "?"), "tmux " + (aboutInfo.tmux || "?")].join(", ")
+  readonly property string aboutDetails: "Speakeasy " + (version || "unknown version") + "\n" + builtWith + "\n"
+    + (Quickshell.env("XDG_CURRENT_DESKTOP") || "unknown desktop") + ", " + Qt.platform.pluginName
+  readonly property string supportEmail: aboutInfo.supportEmail || "help@ninepointlabs.com"
+  readonly property string supportMailto: "mailto:" + supportEmail + "?subject=" + encodeURIComponent("Speakeasy " + version)
+    + "&body=" + encodeURIComponent("\n\n--\n" + aboutDetails)
+
+  function copyText(text, label) {
+    Quickshell.clipboardText = text
+    copiedLabel = label
+    copiedTimer.restart()
+  }
+  Timer { id: copiedTimer; interval: 1500; onTriggered: root.copiedLabel = "" }
+
+  // One paragraph per line, so the license wraps to the panel width.
+  function reflow(text) {
+    return String(text || "").split(/\n\s*\n/).map(function(p) { return p.replace(/\s+/g, " ").trim() })
+      .filter(function(p) { return p !== "" }).join("\n\n")
+  }
+
+  FileView { id: manifestFile; path: root.pluginDir + "/manifest.json"; printErrors: false }
+  FileView { id: licenseFile; path: root.showLicense ? root.pluginDir + "/LICENSE" : ""; printErrors: false }
+
   function countWhere(pred) {
     var n = 0
     for (var i = 0; i < tasks.length; i++) if (pred(tasks[i])) n++
@@ -359,6 +401,18 @@ Panel {
     dismiss()
   }
 
+  function showAbout() {
+    confirmId = ""
+    confirmClearAll = false
+    peekOn = false
+    error = ""
+    showLicense = false
+    view = "about"
+    aboutFlick.contentY = 0
+    if (!aboutInfo.name && !aboutProc.running) aboutProc.running = true
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
   function showList() {
     view = "list"
     sessionIndex = 0
@@ -450,8 +504,13 @@ Panel {
       else if (name === "enter") activateSetting()
       else if (name === "esc") showList()
       else return "unknown key"
+    } else if (view === "about") {
+      if (name === "esc") showList()
+      else if (name === "l") showLicense = !showLicense
+      else return "unknown key"
     } else if (view === "list") {
-      if (name === "s") showSettings()
+      if (name === "a") showAbout()
+      else if (name === "s") showSettings()
       else if (name === "v") showSessions()
       else if (name === "down") move(1)
       else if (name === "up") move(-1)
@@ -606,7 +665,7 @@ Panel {
   }
 
   onOpenedChanged: {
-    if (!opened) { if (!centered) { peekOn = false; confirmId = "" } return }
+    if (!opened) { if (!centered) { peekOn = false; confirmId = ""; if (view === "about") view = "list" } return }
     // The bar dropdown wins over a centered window on the same monitor.
     if (centered) leaveCenter()
     onShown()
@@ -639,6 +698,7 @@ Panel {
   function dismiss() {
     confirmId = ""
     peekOn = false
+    if (view === "about") view = "list"
     if (centered) leaveCenter()
     else close()
   }
@@ -756,7 +816,54 @@ Panel {
     onTriggered: root.refreshPeek()
   }
 
+  Process {
+    id: aboutProc
+    command: [root.cli, "about", "--json"]
+    running: false
+    stdout: StdioCollector { id: aboutOut }
+    stderr: StdioCollector { id: aboutErr }
+    onExited: function(code) {
+      var info = null
+      try { info = code === 0 ? JSON.parse(aboutOut.text) : null } catch (e) {}
+      if (info && typeof info === "object") root.aboutInfo = info
+      else root.error = (aboutErr.text || "speakeasy about failed").trim().replace(/^speakeasy: /, "")
+    }
+  }
+
   // --------------------------------------------------------------- pieces --
+
+  component AboutLabel: Text {
+    width: aboutFacts.labelWidth
+    textFormat: Text.PlainText
+    color: root.faint
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+    font.bold: true
+  }
+
+  component AboutValue: Text {
+    width: aboutFacts.valueWidth
+    textFormat: Text.PlainText
+    color: root.foreground
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+    wrapMode: Text.Wrap
+  }
+
+  component AboutLink: Text {
+    signal activated()
+    textFormat: Text.PlainText
+    color: root.accent
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+
+    MouseArea {
+      anchors.fill: parent
+      anchors.margins: -Style.space(4)
+      cursorShape: Qt.PointingHandCursor
+      onClicked: parent.activated()
+    }
+  }
 
   KeyboardPanel {
     id: panel
@@ -764,7 +871,7 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    focusTarget: root.view === "list" ? keyCatcher : titleField
+    focusTarget: root.view === "list" || root.view === "about" ? keyCatcher : titleField
     contentWidth: panel.fittedContentWidth(Style.space(620))
     contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(900))
 
@@ -773,7 +880,7 @@ Panel {
       anchors.fill: parent
       blocked: root.view === "new" || cwdField.activeFocus
       onCloseRequested: {
-        if (root.view === "settings" || root.view === "sessions") { root.showList(); return }
+        if (root.view === "settings" || root.view === "sessions" || root.view === "about") { root.showList(); return }
         if (root.confirmClearAll) { root.confirmClearAll = false; return }
         if (root.notice !== "") { root.notice = ""; return }
         if (root.confirmId !== "") { root.confirmId = ""; return }
@@ -784,20 +891,24 @@ Panel {
       onMoveRequested: function(dx, dy) {
         if (dy === 0) return
         if (root.view === "settings") root.moveSetting(dy)
+        else if (root.view === "about") aboutFlick.contentY = Math.max(0, Math.min(aboutFlick.contentHeight - aboutFlick.height, aboutFlick.contentY + dy * Style.space(60)))
         else if (root.view === "sessions") root.sessionIndex = Math.max(0, Math.min(root.externalSessions.length - 1, root.sessionIndex + dy))
         else root.move(dy)
       }
       onActivateRequested: {
         if (root.view === "settings") root.activateSetting()
         else if (root.view === "sessions") root.openSession()
+        else if (root.view === "about") return
         else if (root.confirmClearAll) root.clearAllDone()
         else if (root.confirmId !== "") root.stopOrRemove()
         else root.openSelected()
       }
       onDeleteRequested: if (root.view === "list") root.stopOrRemove()
       onTextKey: function(t) {
+        if (root.view === "about" && (t === "l" || t === "L")) root.showLicense = !root.showLicense
         if (root.view !== "list") return
         if (t === "v" || t === "V") root.showSessions()
+        else if (t === "a" || t === "A") root.showAbout()
         else if (t === "n" || t === "N") root.showNew()
         else if (t === "s" || t === "S") root.showSettings()
         else if (t === "p" || t === "P") root.togglePeek()
@@ -837,7 +948,7 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.view === "new" ? "New task" : (root.view === "settings" ? "Settings" : (root.view === "sessions" ? "Sessions" : "Speakeasy"))
+                text: root.view === "new" ? "New task" : (root.view === "settings" ? "Settings" : (root.view === "sessions" ? "Sessions" : (root.view === "about" ? "About Speakeasy" : "Speakeasy")))
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -851,6 +962,7 @@ Panel {
               textFormat: Text.PlainText
               text: root.view === "new" ? "Runs in a hidden terminal. You get a notification when it needs you or is done."
                 : (root.view === "settings" ? "Choose which agents appear when you start a task."
+                : root.view === "about" ? (root.aboutInfo.tagline || "AI agents in hidden terminals, one named tab per task.")
                 : (root.view === "sessions" ? root.externalSessions.length + (root.externalSessions.length === 1 ? " tmux session" : " tmux sessions") : root.subtitle))
               color: root.dim
               font.family: root.fontFamily
@@ -865,6 +977,33 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(4)
 
+            Button {
+              objectName: "aboutButton"
+              visible: root.view === "list"
+              iconText: String.fromCodePoint(0xF02FD)
+              tooltipText: "About Speakeasy (a)"
+              foreground: root.dim
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              iconSize: Style.font.body
+              horizontalPadding: Style.space(6)
+              verticalPadding: Style.space(3)
+              onClicked: root.showAbout()
+            }
+            Button {
+              objectName: "aboutBack"
+              visible: root.view === "about"
+              text: "Back"
+              tooltipText: "Back to the task list (Esc)"
+              foreground: root.dim
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(3)
+              onClicked: root.showList()
+            }
             Button {
               visible: root.view === "list"
               iconText: String.fromCodePoint(0xF0493)
@@ -1667,6 +1806,128 @@ Panel {
           }
         }
 
+        // --------------------------------------------------------- about --
+        Flickable {
+          id: aboutFlick
+          objectName: "aboutPage"
+          visible: root.view === "about"
+          width: parent.width
+          height: Math.min(aboutColumn.implicitHeight, Style.space(560))
+          contentWidth: width
+          contentHeight: aboutColumn.implicitHeight
+          boundsBehavior: Flickable.StopAtBounds
+          clip: true
+
+          Column {
+            id: aboutColumn
+            width: aboutFlick.width
+            spacing: Style.space(10)
+
+            Grid {
+              id: aboutFacts
+              width: parent.width
+              columns: 2
+              columnSpacing: Style.space(12)
+              rowSpacing: Style.space(8)
+              readonly property real labelWidth: Style.space(90)
+              readonly property real valueWidth: width - labelWidth - columnSpacing
+
+              AboutLabel { text: "VERSION" }
+              AboutValue { objectName: "aboutVersion"; text: root.version || "unknown" }
+
+              AboutLabel { text: "MADE BY" }
+              AboutValue { text: root.aboutInfo.organization || "Nine Point Labs" }
+
+              AboutLabel { text: "CREATED" }
+              AboutValue { text: root.aboutInfo.created || "…" }
+
+              AboutLabel { text: "LICENSE" }
+              Column {
+                width: aboutFacts.valueWidth
+                spacing: Style.space(4)
+                AboutValue { text: root.aboutInfo.license ? root.aboutInfo.license + ", " + root.aboutInfo.copyright : "…" }
+                AboutLink {
+                  objectName: "aboutLicenseLink"
+                  text: root.showLicense ? "Hide license" : "Read license (l)"
+                  onActivated: root.showLicense = !root.showLicense
+                }
+              }
+
+              AboutLabel { text: "SUPPORT" }
+              Column {
+                width: aboutFacts.valueWidth
+                spacing: Style.space(6)
+                AboutValue { text: root.supportEmail }
+                Flow {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  Button {
+                    objectName: "aboutEmail"
+                    text: "Email"
+                    tooltipText: "Write to " + root.supportEmail + ", with version details filled in"
+                    bordered: true
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    onClicked: Qt.openUrlExternally(root.supportMailto)
+                  }
+                  Button {
+                    objectName: "aboutCopyEmail"
+                    text: root.copiedLabel === "email" ? "Copied" : "Copy"
+                    tooltipText: "Copy the address"
+                    bordered: true
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    onClicked: root.copyText(root.supportEmail, "email")
+                  }
+                  Button {
+                    objectName: "aboutCopyDetails"
+                    text: root.copiedLabel === "details" ? "Copied" : "Copy version details"
+                    tooltipText: "Speakeasy, Quickshell, Qt, Python and tmux versions, and your desktop"
+                    bordered: true
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    onClicked: root.copyText(root.aboutDetails, "details")
+                  }
+                }
+              }
+
+              AboutLabel { text: "PRIVACY" }
+              AboutValue { objectName: "aboutPrivacy"; color: root.dim; text: root.aboutInfo.privacy || "…" }
+
+              AboutLabel { text: "BUILT WITH" }
+              AboutValue { objectName: "aboutBuiltWith"; color: root.dim; text: root.builtWith }
+
+              AboutLabel { text: "COMMAND" }
+              AboutValue { color: root.dim; text: "speakeasy about prints the same facts in a terminal." }
+            }
+
+            Text {
+              objectName: "aboutLicenseText"
+              visible: root.showLicense
+              width: parent.width
+              textFormat: Text.PlainText
+              text: licenseFile.loaded ? root.reflow(licenseFile.text())
+                : (root.aboutInfo.license ? root.aboutInfo.license + ", " + root.aboutInfo.copyright : "")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+            }
+          }
+        }
+
         // -------------------------------------------------------- notice --
         Text {
           visible: root.view === "list" && (root.notice !== "" || root.confirmClearAll)
@@ -1705,10 +1966,12 @@ Panel {
                : "Tab next field  ·  ←→ choose  ·  Enter open list, type to filter  ·  Ctrl+Enter start  ·  Esc back")
             : root.view === "sessions"
               ? "Enter open  ·  Esc back"
+            : root.view === "about"
+              ? "↑↓ scroll  ·  l license  ·  Esc back"
             : root.view === "settings"
               ? "↑↓ pick  ·  Enter or Space toggle / edit  ·  Enter saves the folder  ·  Esc back"
-              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear done  ·  v sessions  ·  s settings  ·  Esc close"
-                                       : "n new  ·  v sessions  ·  s settings  ·  Esc close")
+              : (root.tasks.length > 0 ? "Enter open  ·  n new  ·  p peek  ·  x stop / remove  ·  c clear done  ·  v sessions  ·  s settings  ·  a about  ·  Esc close"
+                                       : "n new  ·  v sessions  ·  s settings  ·  a about  ·  Esc close")
           color: root.faint
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

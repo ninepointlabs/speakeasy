@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -396,6 +397,62 @@ def make_repo(path, url):
     os.makedirs(os.path.join(path, ".git"), exist_ok=True)
     with open(os.path.join(path, ".git", "config"), "w") as f:
         f.write(f'[remote "origin"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n')
+
+
+class About(unittest.TestCase):
+    def read(self, name):
+        with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_facts_match_the_repo(self):
+        manifest = json.loads(self.read("manifest.json"))
+        license_text = self.read("LICENSE")
+        self.assertEqual(se.VERSION, manifest["version"])
+        self.assertEqual(manifest["author"], "Nine Point Labs")
+        self.assertEqual(se.ABOUT["name"], manifest["name"])
+        self.assertTrue(license_text.startswith(se.ABOUT["license"]))
+        self.assertIn(se.ABOUT["copyright"], license_text)
+        self.assertEqual(se.ABOUT["organization"], "Nine Point Labs")
+        self.assertEqual(se.ABOUT["supportEmail"], "help@ninepointlabs.com")
+        self.assertEqual(os.path.realpath(se.LICENSE_PATH), os.path.realpath(os.path.join(ROOT, "LICENSE")))
+        for name in ("LICENSE", "manifest.json", "README.md", "BarWidget.qml", "Panel.qml", "bin/speakeasy"):
+            self.assertNotIn("Ninepoint", self.read(name), name)
+
+    def test_about_command(self):
+        r = subprocess.run([sys.executable, CLI, "about"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for fact in ("Speakeasy " + se.VERSION, "Nine Point Labs", se.ABOUT["created"], "MIT License",
+                     se.LICENSE_PATH, "help@ninepointlabs.com", "Python ", "no telemetry"):
+            self.assertIn(fact, r.stdout)
+        r = subprocess.run([sys.executable, CLI, "about", "--json"], capture_output=True, text=True, timeout=30)
+        facts = json.loads(r.stdout)
+        self.assertEqual((facts["version"], facts["privacy"], facts["licensePath"]), (se.VERSION, se.PRIVACY, se.LICENSE_PATH))
+        self.assertEqual(facts["python"], "%d.%d.%d" % sys.version_info[:3])
+
+    def test_privacy_names_every_network_host(self):
+        """Adding a network host or a networking module to the code must come
+        with naming it in the privacy statement (PRIVACY in bin/speakeasy)."""
+        code = {name: self.read(name) for name in ("bin/speakeasy", "Panel.qml", "BarWidget.qml", "install.sh")}
+        # The one URL in the code is an example in the MCP tool description; it is never fetched.
+        code["bin/speakeasy"] = code["bin/speakeasy"].replace("https://github.com/ninepointlabs/speakeasy'", "'")
+        for name, text in code.items():
+            for host in re.findall(r"[a-z][a-z0-9+.-]*://(?:[^/@\s\"']+@)?([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)", text):
+                self.assertIn(host, se.PRIVACY, f"{name} names {host}")
+        networking = re.findall(r"^\s*(?:import|from)\s+(socket|ssl|urllib|http|requests|httpx|aiohttp|ftplib|smtplib|xmlrpc|websocket)",
+                                code["bin/speakeasy"], re.M)
+        self.assertEqual(networking, [], "bin/speakeasy now imports a network module; update PRIVACY")
+        for qml in ("Panel.qml", "BarWidget.qml"):
+            for api in ("XMLHttpRequest", "WebSocket", "NetworkRequest"):
+                self.assertNotIn(api, code[qml], f"{qml} uses {api}; update PRIVACY")
+        self.assertIn("no network connections of its own", se.PRIVACY)
+        self.assertIn("own vendors", se.PRIVACY)
+        self.assertIn("~/.local/state/speakeasy/", se.PRIVACY)
+
+    def test_panel_reads_the_cli_facts_and_the_manifest_version(self):
+        qml = self.read("Panel.qml")
+        self.assertIn('command: [root.cli, "about", "--json"]', qml)
+        self.assertIn('root.pluginDir + "/manifest.json"', qml)
+        self.assertIn("function about(): void", self.read("BarWidget.qml"))
 
 
 class Mcp(unittest.TestCase):

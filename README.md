@@ -163,6 +163,7 @@ first line of the answer.
 | `Shift+C` | Clear every completed task, checked or not, after a confirmation |
 | `v` | Sessions: external tmux sessions (not started by Speakeasy), to open and watch |
 | `s` | Settings |
+| `a` | About |
 | `Esc` | Cancel a confirmation, close the peek, then close the panel |
 
 ### Starting a task
@@ -198,6 +199,18 @@ window. The task keeps going, and the list shows it working again.
 
 Every task's terminal has a status line at the bottom with its name and
 agent, and a reminder that closing the window only hides it.
+
+### About
+
+The 󰋽 button at the top of the task list (or `a`) shows the version, Nine
+Point Labs, when Speakeasy was created, the MIT license (readable in place,
+`l`), what Speakeasy does and does not do with your data, the Quickshell, Qt,
+Python and tmux versions, and the support address,
+[help@ninepointlabs.com](mailto:help@ninepointlabs.com), with *Email* (version
+details filled in), *Copy* and *Copy version details* buttons. `Esc` or *Back*
+returns to the list. From a keybinding or a terminal:
+`omarchy-shell ninepointlabs.speakeasy about`. Without the panel,
+`speakeasy about` prints the same facts.
 
 ### Settings
 
@@ -274,6 +287,7 @@ speakeasy set notify off                      # also: default-cwd PATH, quiet-se
 speakeasy models [agent] [--refresh]          # which models each offers
 speakeasy ui [new]                            # the panel, or a terminal without Omarchy
 speakeasy mcp                                 # MCP server on stdio, for other programs (below)
+speakeasy about                               # version, license, support address, privacy (--json for programs)
 ```
 
 `speakeasy new` prints the new task's id; add `--json` for the whole record,
@@ -443,7 +457,7 @@ python3 -m unittest discover -s test -v       # the engine: commands, hooks, mod
 
 The panel can be driven over IPC for testing: `omarchy-shell
 ninepointlabs.speakeasy status`, `present list|new`, `key <name>` (`down`,
-`enter`, `n`, `p`, `x`, `tab`, `open`, `focus:<n>`, `title:<text>`, …), and
+`enter`, `n`, `p`, `x`, `a`, `l`, `tab`, `open`, `focus:<n>`, `title:<text>`, …), `about`, and
 `capture <list|new> <screen> <state-dir>` with `cardGeometry`, which is how the
 screenshots above were taken (from a demo task list, without taking the
 keyboard).
