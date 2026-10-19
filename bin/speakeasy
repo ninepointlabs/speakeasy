@@ -30,7 +30,7 @@ import threading
 import textwrap
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SOCKET = "speakeasy"
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "speakeasy")
@@ -474,6 +474,30 @@ def paste(tid, text, enter=True):
         tmux("send-keys", "-t", session(tid), "Enter")
 
 
+def tmux_quote(text):
+    """One double-quoted argument in tmux command syntax. Backslash, quote
+    and $ are escaped and control characters (newlines too) become octal
+    escapes, so user text stays a single argument of a single command."""
+    out = []
+    for ch in text:
+        if ch in '\\"$':
+            out.append("\\" + ch)
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append("\\%03o" % ord(ch))
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def set_labels(tid, **labels):
+    """Set the session's @se_* options. The commands go to `tmux source-file -`
+    on stdin, so a title never appears in tmux's arguments. "#" is doubled
+    because the status line expands formats in the value."""
+    script = "".join(f"set-option -t {session(tid)} @se_{name} {tmux_quote(value.replace('#', '##'))}\n"
+                     for name, value in labels.items())
+    return tmux("source-file", "-", stdin=script)
+
+
 def write_tmux_conf():
     private_dir(STATE_DIR)
     conf = """# Written by speakeasy; regenerated on every new task.
@@ -553,21 +577,69 @@ def reconcile(tasks):
 
 # ---------------------------------------------------------- notifications --
 
-def notify(task, title, body, urgency="normal"):
+def notify(task, title, body, urgency="normal", generic="A Speakeasy task needs you"):
     """Show a notification whose click opens the task, without blocking.
 
     The text goes to the worker on stdin: the worker lives until the
-    notification is clicked or closed, and its arguments are world-readable."""
+    notification is clicked or closed, and its arguments are world-readable.
+    `generic` is the title used instead when the only way to show the
+    notification is a helper program that would take the text as arguments."""
     if not config().get("notify", True) or not (shutil.which("gdbus") or shutil.which("notify-send")):
         return
     proc = subprocess.Popen([sys.executable, SELF, "_notify", task["id"]],
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True, text=True)
     try:
-        proc.stdin.write(json.dumps({"title": title, "body": body, "urgency": urgency}))
+        proc.stdin.write(json.dumps({"title": title, "body": body, "urgency": urgency, "generic": generic}))
         proc.stdin.close()
     except OSError:
         pass
+
+
+NOTIFY_ACTIONS = ["default", "Open", "open", "Open terminal"]
+NOTIFY_WAIT = 6 * 3600  # give up on a notification nobody clicked or closed
+
+
+def notify_gio(title, body, urgency):
+    """Send through D-Bus from this process with PyGObject, so the text is in
+    no process's arguments. Returns the action clicked, or "" when the
+    notification closes; None if PyGObject or the notification service is
+    not available."""
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+    except (ImportError, ValueError):
+        return None
+    level = {"low": 0, "normal": 1, "critical": 2}.get(urgency, 1)
+    loop, result = GLib.MainLoop(), {"nid": None, "action": ""}
+
+    def on_signal(conn, sender, path, iface, name, params):
+        args = params.unpack()
+        if args[0] != result["nid"]:
+            return
+        if name == "ActionInvoked":
+            result["action"] = args[1]
+        loop.quit()
+
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        # Subscribed before the call; signals are only handled once the loop
+        # runs, by which time the notification's id is known.
+        sub = bus.signal_subscribe(None, "org.freedesktop.Notifications", None, "/org/freedesktop/Notifications",
+                                   None, Gio.DBusSignalFlags.NONE, on_signal)
+        reply = bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                              "org.freedesktop.Notifications", "Notify",
+                              GLib.Variant("(susssasa{sv}i)", ("Speakeasy", 0, "utilities-terminal", title, body,
+                                                               NOTIFY_ACTIONS, {"urgency": GLib.Variant("y", level)}, -1)),
+                              GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, 10000, None)
+    except GLib.Error:
+        return None
+    result["nid"] = reply.unpack()[0]
+    GLib.timeout_add_seconds(NOTIFY_WAIT, loop.quit)
+    loop.run()
+    bus.signal_unsubscribe(sub)
+    return result["action"]
 
 
 def gvariant_str(text):
@@ -577,7 +649,8 @@ def gvariant_str(text):
 
 def notify_dbus(title, body, urgency):
     """Send through D-Bus with a short-lived gdbus call; return the action
-    clicked, or "" when the notification closes. None if gdbus failed."""
+    clicked, or "" when the notification closes. None if gdbus failed.
+    gdbus takes the text as arguments, so callers pass only generic text."""
     level = {"low": 0, "normal": 1, "critical": 2}.get(urgency, 1)
     monitor = subprocess.Popen(["gdbus", "monitor", "--session", "--dest", "org.freedesktop.Notifications",
                                 "--object-path", "/org/freedesktop/Notifications"],
@@ -589,14 +662,14 @@ def notify_dbus(title, body, urgency):
                             "--method", "org.freedesktop.Notifications.Notify",
                             '"Speakeasy"', "uint32 0", '"utilities-terminal"',
                             gvariant_str(title), gvariant_str(body),
-                            '["default", "Open", "open", "Open terminal"]',
+                            json.dumps(NOTIFY_ACTIONS),
                             "{'urgency': <byte %d>}" % level, "int32 -1"],
                            text=True, capture_output=True, timeout=10)
         m = re.search(r"uint32 (\d+)", r.stdout)
         if r.returncode != 0 or not m:
             return None
         nid = m.group(1)
-        deadline = time.time() + 6 * 3600
+        deadline = time.time() + NOTIFY_WAIT
         for line in monitor.stdout:
             if f"ActionInvoked (uint32 {nid}," in line:
                 a = re.search(r"'([^']*)'\)", line)
@@ -616,12 +689,15 @@ def cmd_notify_worker(a):
     except ValueError:
         return
     title, body, urgency = str(msg.get("title", "")), str(msg.get("body", "")), str(msg.get("urgency", "normal"))
-    action = notify_dbus(title, body, urgency) if shutil.which("gdbus") else None
+    generic = str(msg.get("generic") or "A Speakeasy task needs you")
+    action = notify_gio(title, body, urgency)
+    # Without PyGObject the helpers below would take the text as arguments,
+    # so they show only the generic title: never the task's title or body.
+    if action is None and shutil.which("gdbus"):
+        action = notify_dbus(generic, "Click to open its terminal.", urgency)
     if action is None and shutil.which("notify-send"):
-        # Fallback without gdbus: notify-send keeps the text in its arguments
-        # while it waits, so it is sent without the body.
         r = subprocess.run(["notify-send", "--app-name=Speakeasy", f"--urgency={urgency}",
-                            "--icon=utilities-terminal", "--action=default=Open", "--", title],
+                            "--icon=utilities-terminal", "--action=default=Open", "--", generic],
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         action = r.stdout.strip()
     if os.environ.get("SPEAKEASY_DEBUG"):
@@ -763,8 +839,7 @@ def start_task(cfg, agent_id, model, effort, title, prompt, cwd, extra=None, ori
     if r.returncode != 0:
         update_task(tid, status="exited", detail="tmux failed: " + r.stderr.strip())
         raise TaskError("tmux failed to start the task: " + r.stderr.strip())
-    tmux("set-option", "-t", session(tid), "@se_title", title.replace("#", "##"))
-    tmux("set-option", "-t", session(tid), "@se_agent", label.replace("#", "##"))
+    set_labels(tid, title=title, agent=label)
     bump_rev()
     return load_task(tid)
 
@@ -829,7 +904,8 @@ def cmd_run(a):
     if task.get("status") != "stopped":
         task = update_task(a.id, status="exited", exitCode=code, unseen=True,
                            detail="Finished." if code == 0 else f"Exited with status {code}.")
-        notify(task, f"{task['title']} ended", task["detail"] + " Click to see the output.")
+        notify(task, f"{task['title']} ended", task["detail"] + " Click to see the output.",
+               generic="A Speakeasy task ended")
     print(f"\n[speakeasy] {agent['name']} exited with status {code}. "
           f"Close this window, or remove the task with `speakeasy rm {a.id}`.")
 
@@ -929,7 +1005,8 @@ def watch_quiet(tid, agent, stop):
         elif task.get("status") in ("running", "starting"):
             task = update_task(tid, status="ready", unseen=True,
                                detail="Quiet for a while: probably finished or waiting for you.")
-            notify(task, f"{task['title']} is waiting", "The output stopped changing. Click to look.")
+            notify(task, f"{task['title']} is waiting", "The output stopped changing. Click to look.",
+                   generic="A Speakeasy task is waiting")
 
 
 # ------------------------------------------------------------------ hooks --
@@ -979,14 +1056,16 @@ def cmd_hook(a):
         summary = first_line(payload.get("last_assistant_message") or "") or \
             last_assistant_line(payload.get("transcript_path"))
         task = update_task(a.id, status="ready", detail=summary or "Finished its turn.", unseen=True)
-        notify(task, f"{task['title']} is done", summary or "Results are ready. Click to open.")
+        notify(task, f"{task['title']} is done", summary or "Results are ready. Click to open.",
+               generic="A Speakeasy task is done")
     elif ev == "codex":
         if payload.get("type") == "agent-turn-complete":
             msg = (payload.get("last-assistant-message") or "").strip()
             if is_codex_title_turn(msg):
                 return
             task = update_task(a.id, status="ready", detail=first_line(msg) or "Finished its turn.", unseen=True)
-            notify(task, f"{task['title']} is done", first_line(msg, 200) or "Results are ready. Click to open.")
+            notify(task, f"{task['title']} is done", first_line(msg, 200) or "Results are ready. Click to open.",
+                   generic="A Speakeasy task is done")
 
 
 def is_codex_title_turn(msg):
@@ -1308,11 +1387,14 @@ def cmd_seen(a):
 
 def cmd_rename(a):
     t = resolve(a.ref)
-    title = " ".join(a.title).strip()
+    title = " ".join(a.title)
+    if title == "-":
+        title = sys.stdin.read()
+    title = title.strip()
     if not title:
         die("empty title")
     update_task(t["id"], title=title)
-    tmux("set-option", "-t", session(t["id"]), "@se_title", title.replace("#", "##"))
+    set_labels(t["id"], title=title)
 
 
 def stop_task(t):
@@ -1727,7 +1809,7 @@ def main(argv=None):
 
     s = sub.add_parser("rename", help="rename a task")
     s.add_argument("ref")
-    s.add_argument("title", nargs="+")
+    s.add_argument("title", nargs="+", help="new title, or - to read it from stdin")
     s.set_defaults(fn=cmd_rename)
 
     s = sub.add_parser("seen", help="clear a task's unseen mark")
