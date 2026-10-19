@@ -71,10 +71,10 @@ name, with the ones that need you on top.
 | What | Why | Needed? |
 |---|---|---|
 | Omarchy (Hyprland + the Omarchy shell) | The bar icon, panel and centered window | For the panel |
-| Python 3 (standard library only) | The `speakeasy` engine | Yes |
+| Python 3 (standard library; PyGObject when present) | The `speakeasy` engine. PyGObject lets notifications show the task's name (see Security and privacy) | Yes |
 | tmux | Keeps each task's terminal alive and hidden | Yes |
 | At least one agent CLI | Something to run: `claude`, `codex`, `agy` (Antigravity CLI), `muse`, `grok`, `copilot`, `hermes`, `cursor-agent`, `opencode`, `crush` | Yes |
-| notify-send (libnotify) | Desktop notifications | Recommended |
+| notify-send (libnotify) or gdbus | Desktop notifications when PyGObject is missing (generic text only) | Recommended |
 | A terminal emulator | To show a task when you open it; `xdg-terminal-exec` is used when present | Yes |
 
 Omarchy already ships Python, notify-send and a terminal. If tmux is missing:
@@ -276,7 +276,7 @@ speakeasy open next                           # the task that most needs you
 speakeasy open --external my-session          # a tmux session on your regular socket, not a Speakeasy task
 speakeasy peek login -n 20                    # last lines of its screen
 speakeasy send login "yes, go ahead"          # type a line into it and press Enter
-speakeasy rename login "Fix the login loop"
+speakeasy rename login "Fix the login loop"    # or - to read the new title from stdin
 speakeasy stop login                          # stop, keep it in the list
 speakeasy rm login                            # stop and remove
 speakeasy clear                               # remove completed tasks you've checked (opened or peeked)
@@ -294,6 +294,12 @@ speakeasy about                               # version, license, support addres
 or `-o` to open its terminal straight away. Arguments after `--` go to the
 agent itself, e.g. `speakeasy new -a claude -t Review -p "…" -- --permission-mode plan`.
 Use `--prompt=…` (with `=`) for a description that starts with `-`.
+
+Text you type on the command line (`-t`, `-p`, `send`, `rename`) is in that
+`speakeasy` command's own arguments while it runs, like any command you type.
+To keep it out, use `--prompt=-`, `send login -`, `rename login -` (text on
+stdin) or `--stdin-json` (title and description as one line of JSON on
+stdin, which is what the panel uses).
 
 ### From another program (MCP)
 
@@ -369,9 +375,10 @@ Optional, in `~/.config/speakeasy/config.json`:
 An agent entry takes `name`, `bin`, `models` (`""` is the agent's default),
 `modelLabels`, `modelFlag` (passed as `<flag>=<model>`), and `prompt`: `keys`
 (the default: typed into the agent once it is ready), `arg` (the last
-argument, after `--`), or `flag:<name>` (passed as `<name>=<prompt>`). `arg`
-and `flag:` put the prompt in the agent's process arguments, where other
-users on the machine can see it; every built-in agent uses `keys`.
+argument, after `--`), or `flag:<name>` (passed as `<name>=<prompt>`).
+**`arg` and `flag:` are an exception you choose:** they put the prompt in the
+agent's process arguments for as long as the agent runs, where other users
+on the machine can see it. Every built-in agent uses `keys`.
 
 ## How it works
 
@@ -398,14 +405,32 @@ users on the machine can see it; every built-in agent uses `keys`.
 - Task records hold your prompts, so Speakeasy's folders are created `0700`
   and its files `0600`: other users on the machine cannot read them. Folders
   and files left by version 0.1 are tightened on the next run.
-- Prompts and titles never appear in a process's arguments (which any user can
-  see with `ps`). Speakeasy types the prompt into the agent's terminal through
-  a tmux paste buffer fed on stdin, once the agent is ready: after any trust,
-  sign-in or other question on its screen has been answered, so a prompt is
-  never typed into a menu. Notification text reaches the notifier over stdin
-  and D-Bus in the same way. One exception is outside Speakeasy's hands:
-  Codex hands its turn summary to Speakeasy's hook as an argument (that is
-  how Codex's `notify` works); the hook reads it and exits at once.
+- Speakeasy never puts a task's title or prompt in the arguments of any
+  process it starts (arguments are readable by every user on the machine,
+  through `ps` or `/proc/<pid>/cmdline`), not even briefly:
+  - The panel hands the title and description to `speakeasy new` on stdin.
+  - The prompt is typed into the agent's terminal through a tmux paste
+    buffer fed on stdin, once the agent is ready: after any trust, sign-in or
+    other question on its screen has been answered, so a prompt is never
+    typed into a menu.
+  - The title shown in the terminal's status line is given to tmux as
+    commands on stdin (`tmux source-file -`), on start and on rename.
+  - Notification text goes to the notification worker on stdin, and the
+    worker sends it over D-Bus from inside Python (PyGObject). Without
+    PyGObject it falls back to `gdbus` or `notify-send`, which take their text
+    as arguments, so they get only a generic line such as "A Speakeasy task
+    needs you", never the task's title or the agent's message.
+- The remaining exceptions, plainly:
+  - Custom agents you configure with `"prompt": "arg"` or `"flag:…"` get the
+    prompt as an argument (see Configuration). No built-in agent does.
+  - Codex runs its `notify` program with a JSON summary of the finished turn
+    as an argument; that is how Codex's `notify` works and is outside
+    Speakeasy's hands. Codex builds that JSON itself: it carries Codex's
+    last reply and, per Codex's documentation, the messages you sent that
+    turn, which for the first turn is the prompt. It never contains the
+    Speakeasy title. Speakeasy's hook reads it and exits at once.
+  - Text you type on Speakeasy's own command line is in that command's
+    arguments, as with any command; each has a stdin form (see Command line).
 - Every program is started with an argument list, never through a shell.
   Titles, descriptions and model names are passed as `--flag=value` or after
   `--`, so text that starts with `-` can never turn into an agent option.

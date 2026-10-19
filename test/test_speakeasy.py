@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "bin", "speakeasy")
@@ -538,6 +539,109 @@ class Mcp(unittest.TestCase):
             se.main(["agents", "--show", "fake"])
 
 
+TRICKY_TITLES = ['Fix "login" #1; then $HOME', "-starts with a dash", "two\nlines",
+                 "#{session_name} #[bold] ~ \\ 'single' {braces}"]
+
+
+class Recorder:
+    """Stands in for subprocess.run and subprocess.Popen, keeping every argv
+    and whatever was sent on stdin."""
+
+    def __init__(self, run_stdout="", monitor_lines=()):
+        self.calls, self.run_stdout, self.monitor_lines = [], run_stdout, monitor_lines
+
+    def run(self, argv, **kw):
+        self.calls.append((list(argv), kw.get("input") or ""))
+        return subprocess.CompletedProcess(argv, 0, self.run_stdout, "")
+
+    def popen(self, argv, **kw):
+        self.calls.append((list(argv), ""))
+        proc = mock.MagicMock()
+        proc.stdout = iter(self.monitor_lines)
+        return proc
+
+    def patch(self):
+        return mock.patch.multiple(se.subprocess, run=self.run, Popen=self.popen)
+
+    def argv_text(self):
+        return "\n".join(" ".join(argv) for argv, _ in self.calls)
+
+    def stdin_text(self):
+        return "\n".join(stdin for _, stdin in self.calls)
+
+
+class ArgvPrivacy(unittest.TestCase):
+    """Process arguments are readable by every local user (/proc/<pid>/cmdline),
+    so no subprocess Speakeasy starts may carry a task's title or prompt."""
+
+    def test_start_task_and_rename_keep_title_and_prompt_off_argv(self):
+        rec = Recorder()
+        with rec.patch():
+            task = se.start_task(se.config(), "fake", "", "", "SECRET-TITLE-1 #x", "SECRET-PROMPT-1", TMP)
+            old = sys.stdin
+            sys.stdin = io.StringIO("SECRET-TITLE-2\n")
+            try:
+                se.main(["rename", task["id"], "-"])
+            finally:
+                sys.stdin = old
+        self.assertTrue(rec.calls)
+        argv = rec.argv_text()
+        for secret in ("SECRET-TITLE", "SECRET-PROMPT"):
+            self.assertNotIn(secret, argv)
+        # The titles went to tmux on stdin instead.
+        self.assertIn("@se_title \"SECRET-TITLE-1 ##x\"", rec.stdin_text())
+        self.assertIn("@se_title \"SECRET-TITLE-2\"", rec.stdin_text())
+        self.assertEqual(se.load_task(task["id"])["title"], "SECRET-TITLE-2")
+
+    def test_tmux_quote_keeps_user_text_one_argument(self):
+        self.assertEqual(se.tmux_quote('a"b\\c$d'), '"a\\"b\\\\c\\$d"')
+        self.assertEqual(se.tmux_quote("x\ny;#"), '"x\\012y;#"')
+
+    def notify_worker(self, rec, which):
+        payload = {"title": "SECRET-TITLE needs you", "body": "SECRET-BODY", "urgency": "critical",
+                   "generic": "A Speakeasy task needs you"}
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        try:
+            with rec.patch(), mock.patch.object(se, "notify_gio", return_value=None), \
+                    mock.patch.object(se.shutil, "which", lambda name: name in which and "/usr/bin/" + name), \
+                    mock.patch.object(se.time, "sleep"):
+                se.main(["_notify", "abc123"])
+        finally:
+            sys.stdin = old
+
+    def test_gdbus_fallback_gets_no_task_text(self):
+        rec = Recorder(run_stdout="(uint32 7,)\n",
+                       monitor_lines=["/org/freedesktop/Notifications: org.freedesktop.Notifications.NotificationClosed (uint32 7, uint32 2)\n"])
+        self.notify_worker(rec, ("gdbus",))
+        self.assertEqual(rec.calls[1][0][:2], ["gdbus", "call"])
+        self.assertIn('"A Speakeasy task needs you"', rec.calls[1][0])
+        self.assertNotIn("SECRET", rec.argv_text())
+
+    def test_notify_send_fallback_gets_no_task_text(self):
+        rec = Recorder()
+        self.notify_worker(rec, ("notify-send",))
+        self.assertEqual(rec.calls[0][0][0], "notify-send")
+        self.assertEqual(rec.calls[0][0][-1], "A Speakeasy task needs you")
+        self.assertNotIn("SECRET", rec.argv_text())
+
+    def test_notify_sends_text_to_the_worker_on_stdin(self):
+        rec = Recorder()
+        with rec.patch(), mock.patch.object(se, "config", return_value={"notify": True}):
+            se.notify(make_task(title="SECRET-TITLE"), "SECRET-TITLE is done", "SECRET-BODY")
+        self.assertEqual(rec.calls[0][0][-2:], ["_notify", "abc123"])
+        self.assertNotIn("SECRET", rec.argv_text())
+
+    def test_every_notify_call_names_a_generic_title(self):
+        with open(CLI) as f:
+            code = f.read()
+        calls = re.findall(r"notify\(task, f\"\{task\['title'\]\}[^\n]*\n?[^\n]*", code)
+        self.assertTrue(calls)
+        for call in calls:
+            if "needs you" not in call.split(",")[1]:
+                self.assertIn("generic=", call)
+
+
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
 class EndToEnd(unittest.TestCase):
     def run_cli(self, *args, stdin=None):
@@ -601,6 +705,27 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(prefs["recentCwds"][0], os.path.join(root, "app"))
         listed, _ = mcp_call("list_tasks")
         self.assertIn(out["id"], [t["id"] for t in listed["tasks"]])
+
+    def test_tricky_titles_reach_tmux_intact(self):
+        def shown(tid):
+            fmt = ["tmux", "-L", se.SOCKET, "display-message", "-p", "-t", se.session(tid)]
+            raw = subprocess.run(["tmux", "-L", se.SOCKET, "show-options", "-v", "-t", se.session(tid), "@se_title"],
+                                 capture_output=True, text=True).stdout[:-1]
+            # E: expands the value as a format, as the status line does. tmux
+            # leaves "##[" for its style parser, which draws it as a plain "#[".
+            rendered = subprocess.run(fmt + ["#{E:@se_title}"], capture_output=True, text=True).stdout[:-1]
+            return raw, rendered.replace("##[", "#[")
+
+        for title in TRICKY_TITLES:
+            r = self.run_cli("new", "--json", "--stdin-json", "--agent=fake", f"--cwd={TMP}",
+                             stdin=json.dumps({"title": title, "prompt": "p"}) + "\n")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            tid = json.loads(r.stdout)["id"]
+            self.assertEqual(shown(tid), (title.replace("#", "##"), title), title)
+        renamed = "Renamed; \"#2\"\n$x"
+        r = self.run_cli("rename", tid, "-", stdin=renamed)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(shown(tid), (renamed.replace("#", "##"), renamed))
 
     def test_panel_sends_title_and_prompt_on_stdin(self):
         payload = json.dumps({"title": "-Secret title", "prompt": "secret\nprompt"}) + "\n"
