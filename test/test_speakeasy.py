@@ -235,6 +235,21 @@ class Settings(unittest.TestCase):
         self.assertEqual(cfg["hiddenAgents"], ["hermes"])
         self.assertIn("fake", cfg["agents"])  # untouched
 
+    def test_broken_config_warns_and_is_not_overwritten(self):
+        with open(se.CONFIG_PATH, "w") as f:
+            f.write("{bad")
+        se._config_warned = False
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            cfg = se.config()
+            se.config()
+        self.assertEqual(cfg["agents"], {})
+        self.assertEqual(err.getvalue().count("warning: ignoring " + se.CONFIG_PATH), 1)
+        with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
+            se.main(["set", "notify", "off"])
+        with open(se.CONFIG_PATH) as f:
+            self.assertEqual(f.read(), "{bad")
+
     def test_set_values(self):
         se.main(["set", "notify", "off"])
         se.main(["set", "quiet-seconds", "1"])
@@ -643,6 +658,48 @@ class ArgvPrivacy(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+class Cli(unittest.TestCase):
+    def test_help_hides_internal_commands(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out), self.assertRaises(SystemExit):
+            se.main(["--help"])
+        text = out.getvalue()
+        self.assertIn("send", text)
+        for word in ("SUPPRESS", "hook", "_run", "_notify"):
+            self.assertNotIn(word, text)
+
+    def test_interactive_new_needs_a_terminal(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("")), mock.patch.object(sys, "stderr", err), \
+                self.assertRaises(SystemExit):
+            se.main(["new", "-i"])
+        self.assertIn("needs a terminal", err.getvalue())
+
+    def test_send_waits_until_the_first_prompt_is_typed(self):
+        tid = make_task("feed01")["id"]
+        calls = []
+
+        def sleep(_):
+            # type_prompt in the task's terminal gets there in the meantime.
+            calls.append("wait")
+            se.update_task(tid, promptSent=True)
+
+        with mock.patch.object(se, "live_sessions", return_value={se.session(tid): False}), \
+                mock.patch.object(se, "capture", return_value="> "), \
+                mock.patch.object(se.time, "sleep", sleep), \
+                mock.patch.object(se, "paste", lambda t, text: calls.append(text)):
+            se.main(["send", tid, "second", "line"])
+            self.assertEqual(calls, ["wait", "second line"])
+            # Once it has been typed, or while a question is up, no waiting.
+            calls.clear()
+            se.main(["send", tid, "more"])
+            make_task("feed02")
+            with mock.patch.object(se, "live_sessions", return_value={se.session("feed02"): False}), \
+                    mock.patch.object(se, "capture", return_value="Do you trust this folder?"):
+                se.main(["send", "feed02", "1"])
+            self.assertEqual(calls, ["more", "1"])
+
+
 class EndToEnd(unittest.TestCase):
     def run_cli(self, *args, stdin=None):
         env = dict(os.environ, PATH=os.environ["PATH"])

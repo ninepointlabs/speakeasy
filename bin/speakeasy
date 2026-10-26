@@ -213,10 +213,34 @@ def secure_existing_state():
                     os.chmod(fp, 0o600)
 
 
+def read_user_config():
+    """The user's config file and "", or None and why it can't be used.
+    A missing file is fine: it is the same as an empty one."""
+    try:
+        with open(CONFIG_PATH) as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        return {}, ""
+    except (OSError, ValueError) as e:
+        return None, str(e)
+    if not isinstance(user, dict):
+        return None, "not a JSON object"
+    return user, ""
+
+
+_config_warned = False
+
+
 def config():
+    global _config_warned
     cfg = dict(DEFAULT_CONFIG)
-    user = load_json(CONFIG_PATH, {})
-    if isinstance(user, dict):
+    user, err = read_user_config()
+    if user is None:
+        # Say so once, or custom agents and settings vanish without a word.
+        if not _config_warned:
+            print(f"speakeasy: warning: ignoring {CONFIG_PATH} ({err}); using the defaults", file=sys.stderr)
+            _config_warned = True
+    else:
         cfg.update(user)
     return cfg
 
@@ -846,6 +870,8 @@ def start_task(cfg, agent_id, model, effort, title, prompt, cwd, extra=None, ori
 
 def interactive_new(a, cfg):
     """Plain prompts for desktops without the Omarchy panel."""
+    if not sys.stdin.isatty():
+        die("-i asks questions, so it needs a terminal; give --title and --prompt instead")
     installed = [x for x in agents(cfg) if x["installed"]]
     if not installed:
         die("no supported agent is installed")
@@ -1262,9 +1288,9 @@ def cmd_state(a):
 
 def update_config(**changes):
     """Change keys in the user's config file, keeping everything else in it."""
-    user = load_json(CONFIG_PATH, {})
-    if not isinstance(user, dict):
-        die(f"{CONFIG_PATH} is not a JSON object; fix or remove it first")
+    user, err = read_user_config()
+    if user is None:
+        die(f"cannot read {CONFIG_PATH} ({err}); fix or remove it first")
     user.update(changes)
     write_json(CONFIG_PATH, user)
     bump_rev()
@@ -1377,7 +1403,27 @@ def cmd_send(a):
     text = " ".join(a.text)
     if text == "-":
         text = sys.stdin.read().rstrip("\n")
+    wait_for_first_prompt(t)
     paste(t["id"], text)
+
+
+def wait_for_first_prompt(t, timeout=60):
+    """Hold a send until the task's first prompt has been typed and
+    submitted, so the two don't run together into one prompt. A question
+    on screen (a trust dialog) is what the send may be answering, so it
+    goes through at once."""
+    agent = agent_by_id(t["agent"])
+    if not agent or not build_command(t, agent)[1]:
+        return
+    deadline = time.time() + timeout
+    while not (load_task(t["id"]) or {}).get("promptSent"):
+        if session(t["id"]) not in live_sessions():
+            die("that task has no terminal any more")
+        if blocking_question(capture(t["id"], 80)):
+            return
+        if time.time() > deadline:
+            die("the task has not taken its first prompt yet; try again in a moment")
+        time.sleep(0.25)
 
 
 def cmd_seen(a):
@@ -1766,7 +1812,9 @@ def cmd_about(a):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="speakeasy", description="AI agents in hidden terminals, one named tab per task.")
     p.add_argument("--version", action="version", version=f"speakeasy {VERSION}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Internal commands get no help= so --help leaves them out, and the
+    # metavar keeps them out of the usage line.
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
     s = sub.add_parser("new", help="start a task in a hidden terminal")
     s.add_argument("-a", "--agent", default="claude")
@@ -1860,17 +1908,17 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_about)
 
-    s = sub.add_parser("hook", help=argparse.SUPPRESS)
+    s = sub.add_parser("hook")
     s.add_argument("id")
     s.add_argument("event")
     s.add_argument("payload", nargs="*")
     s.set_defaults(fn=cmd_hook)
 
-    s = sub.add_parser("_run", help=argparse.SUPPRESS)
+    s = sub.add_parser("_run")
     s.add_argument("id")
     s.set_defaults(fn=cmd_run)
 
-    s = sub.add_parser("_notify", help=argparse.SUPPRESS)
+    s = sub.add_parser("_notify")
     s.add_argument("id")
     s.set_defaults(fn=cmd_notify_worker)
 
